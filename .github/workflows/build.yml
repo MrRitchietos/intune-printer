@@ -24,7 +24,7 @@ jobs:
         id: ver
         shell: pwsh
         run: |
-          $v = if ('${{ github.ref_type }}' -eq 'tag') { '${{ github.ref_name }}'.TrimStart('v') } else { "2.0.0-ci.${{ github.run_number }}" }
+          $v = if ('${{ github.ref_type }}' -eq 'tag') { '${{ github.ref_name }}'.TrimStart('v') } else { "2.2.0-ci.${{ github.run_number }}" }
           "version=$v" >> $env:GITHUB_OUTPUT
 
       - name: Build PrinterPackager.exe
