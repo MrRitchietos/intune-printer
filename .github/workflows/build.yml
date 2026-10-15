@@ -33,7 +33,7 @@ jobs:
 
       - name: End-to-end test
         shell: powershell
-        run: ./tests/E2E.ps1 -Exe "$PWD\dist\PrinterPackager.exe"
+        run: ./tests/E2E.ps1 -Exe "$PWD\dist\PrinterPackager.exe" -WorkDir "$PWD\e2e"
 
       - uses: actions/upload-artifact@v7
         if: always()
@@ -41,8 +41,8 @@ jobs:
           name: PrinterPackager-${{ steps.ver.outputs.version }}
           path: |
             dist/PrinterPackager.exe
-            C:/e2e/shots/*.png
-            C:/e2e/out/**/*.intunewin
+            e2e/shots/*.png
+            e2e/out/**/*.intunewin
 
       - name: Release
         if: github.ref_type == 'tag'
