@@ -1,0 +1,51 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Version
+        id: ver
+        shell: pwsh
+        run: |
+          $v = if ('${{ github.ref_type }}' -eq 'tag') { '${{ github.ref_name }}'.TrimStart('v') } else { "2.0.0-ci.${{ github.run_number }}" }
+          "version=$v" >> $env:GITHUB_OUTPUT
+
+      - name: Build PrinterPackager.exe
+        shell: pwsh
+        run: ./build/Build.ps1 -Version '${{ steps.ver.outputs.version }}'
+
+      - name: End-to-end test
+        shell: powershell
+        run: ./tests/E2E.ps1 -Exe "$PWD\dist\PrinterPackager.exe"
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: PrinterPackager-${{ steps.ver.outputs.version }}
+          path: |
+            dist/PrinterPackager.exe
+            C:/e2e/shots/*.png
+
+      - name: Release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dist/PrinterPackager.exe
+          generate_release_notes: true
