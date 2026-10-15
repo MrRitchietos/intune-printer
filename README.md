@@ -31,7 +31,7 @@ The printers are saved with driver and settings in that client's folder.
 
 Later, from any PC, switch to **Library**, pick the client and publish.
 The printers don't need to be installed on that PC.
-**Export** and **Import** move a client as one zip file.
+**Export** and **Import** move a client as one zip file. Export only takes printers saved to that client; with ticked printers it offers to save them first.
 
 **+ New printer** adds a printer that isn't installed anywhere: name, IP, a driver from this PC or from an .inf, settings and logo.
 
