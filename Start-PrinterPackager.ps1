@@ -940,7 +940,19 @@ function New-PrinterPackage
 
     Set-Step 'Preparing...' 2
     $template = Resolve-PsadtTemplate
-    $intuneWinUtil = if ($Request.CreateIntuneWin) { Resolve-IntuneWinAppUtil } else { $null }
+    $intuneWinUtil = $null
+    if ($Request.CreateIntuneWin)
+    {
+        try { $intuneWinUtil = Resolve-IntuneWinAppUtil }
+        catch
+        {
+            # Offline "save files": keep going without the .intunewin, but always make the .zip.
+            if (-not $Request.IntuneWinOptional) { throw }
+            Write-Log "$($_.Exception.Message) Saving without .intunewin." 'WARN'
+            $Request.CreateIntuneWin = $false
+            $Request.CreateZip = $true
+        }
+    }
 
     if (Test-Path -LiteralPath $root)
     {
@@ -1591,7 +1603,8 @@ function Save-Printers
         try
         {
             $pkg = New-PrinterPackage -Request $req
-            $results.Add([pscustomobject]@{ Printer = $name; Status = 'Saved'; Version = $pkg.Version; Url = ''; Logo = $pkg.Logo; Folder = $pkg.Folder; Error = '' })
+            $status = if ($pkg.IntuneWin) { 'Saved' } else { 'SavedNoIntuneWin' }
+            $results.Add([pscustomobject]@{ Printer = $name; Status = $status; Version = $pkg.Version; Url = ''; Logo = $pkg.Logo; Folder = $pkg.Folder; Error = '' })
         }
         catch
         {
@@ -2576,6 +2589,7 @@ function Show-Result
     $ui.TxtResultUninstall.Text = $Result.UninstallCommand
     $notes = 'Detection: custom script Detection.ps1. Logo: Logo.png. Everything is in the folder, see Intune-Upload-Info.txt.'
     if (-not $Result.DriverIncluded) { $notes += ' The driver is NOT included: devices need it already.' }
+    if (-not $Result.IntuneWin) { $notes += ' No .intunewin was made: IntuneWinAppUtil.exe is not available offline. Put it next to PrinterPackager.exe.' }
     $ui.TxtResultNotes.Text = $notes
     $ui.BusyCard.Visibility = 'Collapsed'
     $ui.ResultListCard.Visibility = 'Collapsed'
@@ -2602,6 +2616,7 @@ function Show-ResultList
             'Failed' { $r.Error }
             'Created' { "New app, version $($r.Version)" }
             'Updated' { "Existing app updated to version $($r.Version)" }
+            'SavedNoIntuneWin' { "Saved without .intunewin (IntuneWinAppUtil.exe not available offline), version $($r.Version)" }
             default { "Saved, version $($r.Version)" }
         }
         [pscustomobject]@{
@@ -2664,6 +2679,7 @@ function Start-SaveFiles
 {
     $requests = Get-PackageRequests
     if (-not $requests) { return }
+    foreach ($r in $requests) { $r.IntuneWinOptional = $true }
     $ui.ExpLog.IsExpanded = $true
     if ($requests.Count -eq 1)
     {
