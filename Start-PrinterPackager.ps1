@@ -2181,8 +2181,13 @@ $CustomLogo = $null
 function Update-PrinterList
 {
     param ([object[]]$Printers)
-    # WPF can't turn a path on a PowerShell object into an image, so each row gets a ready bitmap.
-    foreach ($p in $Printers) { $p | Add-Member -NotePropertyName LogoImage -NotePropertyValue (New-Bitmap $p.LogoPath) -Force }
+    # Function output is wrapped in a PSObject, which WPF can't show as an image; store the raw bitmap.
+    foreach ($p in $Printers)
+    {
+        $img = [Windows.Media.ImageSource](New-Bitmap $p.LogoPath)
+        $p.PSObject.Properties.Remove('LogoImage')
+        $p.PSObject.Properties.Add([Management.Automation.PSNoteProperty]::new('LogoImage', $img))
+    }
     $script:AllPrinters = @($Printers)
     $view = [Windows.Data.CollectionViewSource]::GetDefaultView($script:AllPrinters)
     $view.Filter = [Predicate[object]]{
