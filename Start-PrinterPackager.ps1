@@ -2121,6 +2121,15 @@ $window = [Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader
 $ui = @{}
 foreach ($node in $xaml.SelectNodes('//*[@Name]')) { $ui[$node.Name] = $window.FindName($node.Name) }
 
+# Raw .NET values for data binding (PowerShell's PSObject wrapper breaks image/brush bindings).
+function ConvertTo-Brush
+{
+    param ([string]$Color)
+    $brush = [Windows.Media.Brush](New-Object Windows.Media.BrushConverter).ConvertFromString($Color)
+    $brush.Freeze()
+    return , $brush
+}
+
 function New-Bitmap
 {
     param ([string]$Path)
@@ -2381,9 +2390,9 @@ function Update-SelectedPrinter
             $ip = "$($o.HostAddress)".Trim()
             [pscustomobject]@{
                 Name        = $o.TargetName
-                Logo        = New-Bitmap $o.LogoPath
-                Detail      = if ($ip) { "$ip  -  $($p.DriverName)" } else { "No IP address: click it to enter one" }
-                DetailColor = if ($ip) { '#616161' } else { '#B54700' }
+                Logo        = [Windows.Media.ImageSource](New-Bitmap $o.LogoPath)
+                Detail      = [string]$(if ($ip) { "$ip  -  $($p.DriverName)" } else { 'No IP address: click it to enter one' })
+                DetailColor = [Windows.Media.Brush](ConvertTo-Brush $(if ($ip) { '#616161' } else { '#B54700' }))
             }
         })
         return
@@ -2585,12 +2594,12 @@ function Show-ResultList
         }
         [pscustomobject]@{
             Printer        = $r.Printer
-            Logo           = New-Bitmap $r.Logo
-            Detail         = $detail
-            DetailColor    = if ($r.Status -eq 'Failed') { '#C42B1C' } else { '#616161' }
-            Url            = $r.Url
+            Logo           = [Windows.Media.ImageSource](New-Bitmap $r.Logo)
+            Detail         = [string]$detail
+            DetailColor    = [Windows.Media.Brush](ConvertTo-Brush $(if ($r.Status -eq 'Failed') { '#C42B1C' } else { '#616161' }))
+            Url            = [string]$r.Url
             LinkText       = 'Open in Intune'
-            LinkVisibility = if ($r.Url) { 'Visible' } else { 'Collapsed' }
+            LinkVisibility = [Windows.Visibility]$(if ($r.Url) { 'Visible' } else { 'Collapsed' })
         }
     })
     $ui.BusyCard.Visibility = 'Collapsed'
