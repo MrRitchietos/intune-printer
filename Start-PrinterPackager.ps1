@@ -128,6 +128,7 @@ function Write-Log
 function Set-Step
 {
     param ([string]$Text, [int]$Percent = -1)
+    if ($script:ProgressRange -and $Percent -ge 0) { $Percent = $script:ProgressRange[0] + [int](($script:ProgressRange[1] - $script:ProgressRange[0]) * $Percent / 100) }
     if ($Sync) { $Sync.Step = $Text; $Sync.Percent = $Percent }
     Write-Log $Text
 }
@@ -1153,6 +1154,418 @@ Logs on devices    : C:\Windows\Logs\Software
     }
 }
 
+
+#region Intune (Microsoft Graph)
+# Sign-in uses the Microsoft Graph Command Line Tools public client (same as Connect-MgGraph).
+# Tokens live in memory only and are gone when the app closes.
+$GraphClientId = '14d82eec-204b-4c2f-b7e8-296a70dab67e'
+$GraphScopes = 'https://graph.microsoft.com/DeviceManagementApps.ReadWrite.All https://graph.microsoft.com/User.Read offline_access openid profile'
+$GraphBase = 'https://graph.microsoft.com/beta'
+
+function ConvertFrom-JwtPayload
+{
+    param ([string]$Token)
+    $part = $Token.Split('.')[1].Replace('-', '+').Replace('_', '/')
+    switch ($part.Length % 4) { 2 { $part += '==' } 3 { $part += '=' } }
+    return [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($part)) | ConvertFrom-Json
+}
+
+function New-AuthObject
+{
+    param ($TokenResponse)
+    $claims = ConvertFrom-JwtPayload $TokenResponse.access_token
+    $auth = @{
+        AccessToken  = $TokenResponse.access_token
+        RefreshToken = $TokenResponse.refresh_token
+        ExpiresOn    = (Get-Date).AddSeconds([int]$TokenResponse.expires_in - 120)
+        TenantId     = $claims.tid
+        User         = if ($claims.upn) { $claims.upn } else { $claims.unique_name }
+        TenantName   = ''
+    }
+    try
+    {
+        $org = Invoke-RestMethod -Uri 'https://graph.microsoft.com/v1.0/organization?$select=displayName' -Headers @{ Authorization = "Bearer $($auth.AccessToken)" }
+        $auth.TenantName = @($org.value)[0].displayName
+    }
+    catch { }
+    return $auth
+}
+
+function Invoke-TokenRequest
+{
+    param ([string]$Tenant, [hashtable]$Body)
+    $Body.client_id = $GraphClientId
+    return Invoke-RestMethod -Method Post -Uri "https://login.microsoftonline.com/$Tenant/oauth2/v2.0/token" -Body $Body -ContentType 'application/x-www-form-urlencoded'
+}
+
+function Connect-IntuneBrowser
+{
+    # Authorization code + PKCE with a loopback redirect: the normal Microsoft sign-in page (MFA included) in the browser.
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    $tcp = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, 0)
+    $tcp.Start(); $port = $tcp.LocalEndpoint.Port; $tcp.Stop()
+    $redirect = "http://localhost:$port/"
+    $bytes = New-Object byte[] 48
+    [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+    $verifier = [Convert]::ToBase64String($bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+    $sha = [Security.Cryptography.SHA256]::Create()
+    $challenge = [Convert]::ToBase64String($sha.ComputeHash([Text.Encoding]::ASCII.GetBytes($verifier))).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+    $state = [guid]::NewGuid().ToString('N')
+
+    $listener = New-Object Net.HttpListener
+    $listener.Prefixes.Add($redirect)
+    $listener.Start()
+    try
+    {
+        $url = 'https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize?client_id=' + $GraphClientId +
+            '&response_type=code&response_mode=query&prompt=select_account' +
+            '&redirect_uri=' + [Uri]::EscapeDataString($redirect) +
+            '&scope=' + [Uri]::EscapeDataString($GraphScopes) +
+            '&code_challenge=' + $challenge + '&code_challenge_method=S256&state=' + $state
+        Set-Step 'Sign in in the browser window that just opened...'
+        Start-Process $url
+        $pending = $listener.GetContextAsync()
+        if (-not $pending.Wait([TimeSpan]::FromMinutes(5))) { throw 'Sign-in timed out.' }
+        $context = $pending.Result
+        $query = $context.Request.QueryString
+        $ok = $query['code'] -and $query['state'] -eq $state
+        $html = if ($ok) { 'Signed in. You can close this tab and go back to Printer Packager.' } else { "Sign-in failed: $($query['error_description'])" }
+        $page = [Text.Encoding]::UTF8.GetBytes("<html><body style=`"font-family:Segoe UI,sans-serif;padding:40px`"><h3>$([Net.WebUtility]::HtmlEncode($html))</h3></body></html>")
+        $context.Response.ContentType = 'text/html; charset=utf-8'
+        $context.Response.OutputStream.Write($page, 0, $page.Length)
+        $context.Response.Close()
+        if (-not $ok) { throw "Sign-in failed: $($query['error_description'])" }
+        $code = $query['code']
+    }
+    finally { $listener.Stop(); $listener.Close() }
+
+    Set-Step 'Finishing sign-in...'
+    $token = Invoke-TokenRequest -Tenant 'organizations' -Body @{ grant_type = 'authorization_code'; code = $code; redirect_uri = $redirect; code_verifier = $verifier; scope = $GraphScopes }
+    $auth = New-AuthObject $token
+    Write-Log "Signed in as $($auth.User) ($($auth.TenantName))." 'OK'
+    return [pscustomobject]@{ __Result = $true; Auth = $auth }
+}
+
+function Connect-IntuneDeviceCode
+{
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    $dc = Invoke-RestMethod -Method Post -Uri 'https://login.microsoftonline.com/organizations/oauth2/v2.0/devicecode' -Body @{ client_id = $GraphClientId; scope = $GraphScopes } -ContentType 'application/x-www-form-urlencoded'
+    Set-Step "Go to $($dc.verification_uri) and enter code $($dc.user_code)"
+    if ($Sync) { $Sync.DeviceCode = $dc.user_code }
+    $deadline = (Get-Date).AddSeconds([int]$dc.expires_in)
+    while ((Get-Date) -lt $deadline)
+    {
+        Start-Sleep -Seconds ([Math]::Max(3, [int]$dc.interval))
+        try
+        {
+            $token = Invoke-TokenRequest -Tenant 'organizations' -Body @{ grant_type = 'urn:ietf:params:oauth:grant-type:device_code'; device_code = $dc.device_code }
+            $auth = New-AuthObject $token
+            Write-Log "Signed in as $($auth.User) ($($auth.TenantName))." 'OK'
+            return [pscustomobject]@{ __Result = $true; Auth = $auth }
+        }
+        catch
+        {
+            $body = "$($_.ErrorDetails.Message)"
+            if ($body -notmatch 'authorization_pending|slow_down') { throw "Sign-in failed: $body" }
+        }
+    }
+    throw 'Sign-in timed out.'
+}
+
+function Update-GraphToken
+{
+    param ([hashtable]$Auth)
+    if ((Get-Date) -lt $Auth.ExpiresOn) { return }
+    $token = Invoke-TokenRequest -Tenant $Auth.TenantId -Body @{ grant_type = 'refresh_token'; refresh_token = $Auth.RefreshToken; scope = $GraphScopes }
+    $Auth.AccessToken = $token.access_token
+    if ($token.refresh_token) { $Auth.RefreshToken = $token.refresh_token }
+    $Auth.ExpiresOn = (Get-Date).AddSeconds([int]$token.expires_in - 120)
+}
+
+function Invoke-Graph
+{
+    param ([hashtable]$Auth, [string]$Method = 'GET', [string]$Path, $Body)
+    $uri = if ($Path -like 'https://*') { $Path } else { "$GraphBase/$Path" }
+    $json = if ($null -ne $Body) { $Body | ConvertTo-Json -Depth 10 -Compress } else { $null }
+    for ($attempt = 1; ; $attempt++)
+    {
+        Update-GraphToken $Auth
+        try
+        {
+            $params = @{ Method = $Method; Uri = $uri; Headers = @{ Authorization = "Bearer $($Auth.AccessToken)" }; ContentType = 'application/json; charset=utf-8' }
+            if ($json) { $params.Body = [Text.Encoding]::UTF8.GetBytes($json) }
+            return Invoke-RestMethod @params
+        }
+        catch
+        {
+            $status = 0
+            try { $status = [int]$_.Exception.Response.StatusCode } catch { }
+            if ($attempt -lt 5 -and ($status -eq 429 -or $status -ge 500)) { Start-Sleep -Seconds (3 * $attempt); continue }
+            $detail = "$($_.ErrorDetails.Message)"
+            try { $detail = ($detail | ConvertFrom-Json).error.message } catch { }
+            if ($status -eq 403) { $detail = "Access denied. Your account needs the Intune Administrator or Application Manager role, and the tenant must allow 'DeviceManagementApps.ReadWrite.All'. ($detail)" }
+            throw "Graph $Method $Path failed ($status): $detail"
+        }
+    }
+}
+
+function Get-PrinterAppTag
+{
+    param ([string]$PrinterName)
+    return "PrinterPackager:$PrinterName"
+}
+
+function Get-PrinterApps
+{
+    # All Win32 apps that Printer Packager published, keyed by printer name.
+    param ([hashtable]$Auth)
+    $map = @{}
+    $next = "deviceAppManagement/mobileApps?`$filter=isof('microsoft.graph.win32LobApp')&`$select=id,displayName,displayVersion,notes"
+    while ($next)
+    {
+        $page = Invoke-Graph -Auth $Auth -Path $next
+        foreach ($app in @($page.value))
+        {
+            if ("$($app.notes)" -match '(?m)^PrinterPackager:(.+)$') { $map[$Matches[1].Trim()] = $app }
+        }
+        $next = $page.'@odata.nextLink'
+    }
+    return $map
+}
+
+function Get-IntuneWinInfo
+{
+    # Reads Detection.xml and extracts the encrypted payload from a .intunewin file.
+    param ([string]$Path, [string]$ExtractTo)
+    Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+    $zip = [IO.Compression.ZipFile]::OpenRead($Path)
+    try
+    {
+        $meta = $zip.Entries | Where-Object { $_.FullName -match '(^|/)Metadata/Detection\.xml$' } | Select-Object -First 1
+        if (-not $meta) { throw "$Path is not a valid .intunewin file." }
+        $reader = New-Object IO.StreamReader($meta.Open())
+        try { $xml = [xml]$reader.ReadToEnd() } finally { $reader.Dispose() }
+        $info = $xml.ApplicationInfo
+        $content = $zip.Entries | Where-Object { $_.FullName -match "(^|/)Contents/$([regex]::Escape($info.FileName))$" } | Select-Object -First 1
+        $target = Join-Path $ExtractTo $info.FileName
+        [IO.Compression.ZipFileExtensions]::ExtractToFile($content, $target, $true)
+        return [pscustomobject]@{ Info = $info; EncryptedFile = $target }
+    }
+    finally { $zip.Dispose() }
+}
+
+function Wait-IntuneFileState
+{
+    param ([hashtable]$Auth, [string]$FileUri, [string]$Stage)
+    for ($i = 0; $i -lt 120; $i++)
+    {
+        $file = Invoke-Graph -Auth $Auth -Path $FileUri
+        switch -Wildcard ($file.uploadState)
+        {
+            "${Stage}Success" { return $file }
+            "${Stage}Failed" { throw "Intune reported $Stage failed." }
+            "${Stage}TimedOut" { throw "Intune reported $Stage timed out." }
+        }
+        Start-Sleep -Seconds 3
+    }
+    throw "Intune did not finish $Stage in time."
+}
+
+function Send-IntuneContent
+{
+    # contentVersion -> file -> Azure blob (6 MB blocks) -> commit -> committedContentVersion
+    param ([hashtable]$Auth, [string]$AppId, [string]$IntuneWinPath, [int]$StartPercent, [int]$EndPercent, [string]$Label)
+    $tmp = Join-Path ([IO.Path]::GetTempPath()) ("PrinterPackager_up_" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    New-Item -Path $tmp -ItemType Directory -Force | Out-Null
+    try
+    {
+        $pkg = Get-IntuneWinInfo -Path $IntuneWinPath -ExtractTo $tmp
+        $base = "deviceAppManagement/mobileApps/$AppId/microsoft.graph.win32LobApp/contentVersions"
+        $version = Invoke-Graph -Auth $Auth -Method POST -Path $base -Body @{}
+        $fileBody = [ordered]@{
+            '@odata.type' = '#microsoft.graph.mobileAppContentFile'
+            name          = $pkg.Info.FileName
+            size          = [int64]$pkg.Info.UnencryptedContentSize
+            sizeEncrypted = [int64](Get-Item -LiteralPath $pkg.EncryptedFile).Length
+            manifest      = $null
+            isDependency  = $false
+        }
+        $file = Invoke-Graph -Auth $Auth -Method POST -Path "$base/$($version.id)/files" -Body $fileBody
+        $fileUri = "$base/$($version.id)/files/$($file.id)"
+        $file = Wait-IntuneFileState -Auth $Auth -FileUri $fileUri -Stage 'azureStorageUriRequest'
+
+        $chunkSize = 6MB
+        $stream = [IO.File]::OpenRead($pkg.EncryptedFile)
+        $ids = New-Object System.Collections.Generic.List[string]
+        try
+        {
+            $count = [Math]::Max(1, [Math]::Ceiling($stream.Length / $chunkSize))
+            $buffer = New-Object byte[] $chunkSize
+            for ($i = 0; $i -lt $count; $i++)
+            {
+                $read = $stream.Read($buffer, 0, $chunkSize)
+                $data = New-Object byte[] $read
+                [Array]::Copy($buffer, $data, $read)
+                $id = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($i.ToString('0000')))
+                $ids.Add($id)
+                for ($try = 1; ; $try++)
+                {
+                    try
+                    {
+                        $wc = New-Object Net.WebClient
+                        $wc.Headers['x-ms-blob-type'] = 'BlockBlob'
+                        [void]$wc.UploadData("$($file.azureStorageUri)&comp=block&blockid=$([Uri]::EscapeDataString($id))", 'PUT', $data)
+                        $wc.Dispose()
+                        break
+                    }
+                    catch { if ($try -ge 4) { throw "Upload to Azure storage failed: $($_.Exception.Message)" }; Start-Sleep -Seconds (2 * $try) }
+                }
+                $pct = $StartPercent + [int](($EndPercent - $StartPercent) * ($i + 1) / $count)
+                Set-Step ("{0}: uploading {1:N0} of {2:N0} MB" -f $Label, ([Math]::Min($stream.Length, ($i + 1) * $chunkSize) / 1MB), ($stream.Length / 1MB)) $pct
+            }
+        }
+        finally { $stream.Dispose() }
+
+        $blockList = '<?xml version="1.0" encoding="utf-8"?><BlockList>' + (($ids | ForEach-Object { "<Latest>$_</Latest>" }) -join '') + '</BlockList>'
+        $wc = New-Object Net.WebClient
+        $wc.Headers['Content-Type'] = 'application/xml'
+        [void]$wc.UploadString("$($file.azureStorageUri)&comp=blocklist", 'PUT', $blockList)
+        $wc.Dispose()
+
+        $enc = $pkg.Info.EncryptionInfo
+        $commit = @{ fileEncryptionInfo = [ordered]@{
+            encryptionKey        = $enc.EncryptionKey
+            macKey               = $enc.MacKey
+            initializationVector = $enc.InitializationVector
+            mac                  = $enc.Mac
+            profileIdentifier    = 'ProfileVersion1'
+            fileDigest           = $enc.FileDigest
+            fileDigestAlgorithm  = $enc.FileDigestAlgorithm
+        } }
+        Set-Step "${Label}: Intune is processing the upload..."
+        Invoke-Graph -Auth $Auth -Method POST -Path "$fileUri/commit" -Body $commit | Out-Null
+        [void](Wait-IntuneFileState -Auth $Auth -FileUri $fileUri -Stage 'commitFile')
+        Invoke-Graph -Auth $Auth -Method PATCH -Path "deviceAppManagement/mobileApps/$AppId" -Body @{ '@odata.type' = '#microsoft.graph.win32LobApp'; committedContentVersion = $version.id } | Out-Null
+    }
+    finally { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+function Get-NextVersion
+{
+    # Keeps the requested version unless Intune already has the same or a newer one; then bumps the last number.
+    param ([string]$Requested, [string]$Existing)
+    $r = $null; $e = $null
+    if (-not $Existing -or -not [version]::TryParse($Existing, [ref]$e)) { return $Requested }
+    if ([version]::TryParse($Requested, [ref]$r) -and $r -gt $e) { return $Requested }
+    $parts = @($e.Major, [Math]::Max(0, $e.Minor), [Math]::Max(0, $e.Build))
+    $parts[2]++
+    return ($parts -join '.')
+}
+
+function Publish-PrinterApp
+{
+    param ([hashtable]$Auth, $Package, [string]$PrinterName, $Existing, [string]$Description, [int]$StartPercent, [int]$EndPercent)
+    $label = $PrinterName
+    $detection = [Convert]::ToBase64String([IO.File]::ReadAllBytes($Package.Detection))
+    $icon = [Convert]::ToBase64String([IO.File]::ReadAllBytes($Package.Logo))
+    $body = [ordered]@{
+        '@odata.type'                  = '#microsoft.graph.win32LobApp'
+        displayName                    = $Package.DisplayName
+        description                    = $Description
+        publisher                      = $Package.Publisher
+        displayVersion                 = $Package.Version
+        developer                      = 'Printer Packager'
+        notes                          = Get-PrinterAppTag $PrinterName
+        fileName                       = Split-Path -Leaf $Package.IntuneWin
+        setupFilePath                  = 'Invoke-AppDeployToolkit.exe'
+        installCommandLine             = $Package.InstallCommand
+        uninstallCommandLine           = $Package.UninstallCommand
+        applicableArchitectures        = 'x64'
+        minimumSupportedWindowsRelease = '1809'
+        installExperience              = [ordered]@{ runAsAccount = 'system'; deviceRestartBehavior = 'suppress'; maxRunTimeInMinutes = 30 }
+        returnCodes                    = @(
+            @{ returnCode = 0; type = 'success' }, @{ returnCode = 1707; type = 'success' }, @{ returnCode = 3010; type = 'softReboot' },
+            @{ returnCode = 1641; type = 'hardReboot' }, @{ returnCode = 1618; type = 'retry' })
+        detectionRules                 = @([ordered]@{
+            '@odata.type'         = '#microsoft.graph.win32LobAppPowerShellScriptDetection'
+            enforceSignatureCheck = $false
+            runAs32Bit            = $false
+            scriptContent         = $detection
+        })
+        largeIcon                      = @{ type = 'image/png'; value = $icon }
+        isFeatured                     = $false
+    }
+
+    if ($Existing)
+    {
+        $appId = $Existing.id
+        Set-Step "${label}: updating the existing Intune app..." $StartPercent
+        Invoke-Graph -Auth $Auth -Method PATCH -Path "deviceAppManagement/mobileApps/$appId" -Body $body | Out-Null
+        $action = 'Updated'
+    }
+    else
+    {
+        Set-Step "${label}: creating the Intune app..." $StartPercent
+        $app = Invoke-Graph -Auth $Auth -Method POST -Path 'deviceAppManagement/mobileApps' -Body $body
+        $appId = $app.id
+        $action = 'Created'
+    }
+
+    Send-IntuneContent -Auth $Auth -AppId $appId -IntuneWinPath $Package.IntuneWin -StartPercent $StartPercent -EndPercent ($EndPercent - 2) -Label $label
+
+    if (-not $Existing)
+    {
+        Set-Step "${label}: making it available in Company Portal..."
+        $assign = @{ mobileAppAssignments = @(@{
+            '@odata.type' = '#microsoft.graph.mobileAppAssignment'
+            intent        = 'available'
+            target        = @{ '@odata.type' = '#microsoft.graph.allLicensedUsersAssignmentTarget' }
+            settings      = @{ '@odata.type' = '#microsoft.graph.win32LobAppAssignmentSettings'; notifications = 'showAll'; deliveryOptimizationPriority = 'notConfigured' }
+        }) }
+        Invoke-Graph -Auth $Auth -Method POST -Path "deviceAppManagement/mobileApps/$appId/assign" -Body $assign | Out-Null
+    }
+    Write-Log "$action Intune app '$($Package.DisplayName)' version $($Package.Version)." 'OK'
+    return [pscustomobject]@{ AppId = $appId; Action = $action; Url = "https://intune.microsoft.com/#view/Microsoft_Intune_Apps/SettingsMenu/~/0/appId/$appId" }
+}
+
+function Publish-Printers
+{
+    # Bulk: one Intune app per printer. A failure on one printer doesn't stop the others.
+    param ([hashtable]$Auth, [object[]]$Requests)
+    $ErrorActionPreference = 'Stop'
+    Set-Step 'Looking up existing printer apps in Intune...' 1
+    $existing = Get-PrinterApps -Auth $Auth
+    $results = New-Object System.Collections.Generic.List[object]
+    $n = $Requests.Count
+    for ($i = 0; $i -lt $n; $i++)
+    {
+        $req = $Requests[$i]
+        $name = "$($req.TargetName)".Trim(); if (-not $name) { $name = $req.Printer.Name }
+        $from = [int](100 * $i / $n); $to = [int](100 * ($i + 1) / $n)
+        try
+        {
+            $app = $existing[$name]
+            $req.AppVersion = Get-NextVersion -Requested $req.AppVersion -Existing $(if ($app) { $app.displayVersion })
+            $req.CreateIntuneWin = $true
+            Set-Step "Packaging $name ($($i + 1) of $n)..." $from
+            $script:ProgressRange = @($from, [int]($from + ($to - $from) * 0.5))
+            try { $pkg = New-PrinterPackage -Request $req } finally { $script:ProgressRange = $null }
+            $desc = "Installs the printer $name ($($req.HostAddress)).`nDriver: $($req.Printer.DriverName)"
+            if ($req.Printer.Location) { $desc += "`nLocation: $($req.Printer.Location)" }
+            $pub = Publish-PrinterApp -Auth $Auth -Package $pkg -PrinterName $name -Existing $app -Description $desc -StartPercent ([int]($from + ($to - $from) * 0.5)) -EndPercent $to
+            $results.Add([pscustomobject]@{ Printer = $name; Status = $pub.Action; Version = $pkg.Version; Url = $pub.Url; Logo = $pkg.Logo; Folder = $pkg.Folder; Error = '' })
+        }
+        catch
+        {
+            Write-Log "$name failed: $($_.Exception.Message)" 'ERROR'
+            $results.Add([pscustomobject]@{ Printer = $name; Status = 'Failed'; Version = ''; Url = ''; Logo = $req.LogoPath; Folder = ''; Error = $_.Exception.Message })
+        }
+    }
+    Set-Step 'Done.' 100
+    return [pscustomobject]@{ __Result = $true; Results = $results.ToArray() }
+}
+#endregion
+
 }
 . $WorkerCode
 $WorkerCodeText = $WorkerCode.ToString()
@@ -1953,7 +2366,7 @@ function Save-WindowImage
     $source = [Windows.PresentationSource]::FromVisual($window)
     $scale = if ($source) { $source.CompositionTarget.TransformToDevice.M11 } else { 1 }
     $content = $window.Content
-    $rtb = New-Object Windows.Media.Imaging.RenderTargetBitmap([int]($content.ActualWidth * $scale), [int]($content.ActualHeight * $scale), 96 * $scale, 96 * $scale, [Windows.Media.PixelFormats]::Pbgra32)
+    $rtb = [Windows.Media.Imaging.RenderTargetBitmap]::new([int]($content.ActualWidth * $scale), [int]($content.ActualHeight * $scale), [double](96 * $scale), [double](96 * $scale), [Windows.Media.PixelFormats]::Pbgra32)
     $rtb.Render($content)
     $enc = New-Object Windows.Media.Imaging.PngBitmapEncoder
     $enc.Frames.Add([Windows.Media.Imaging.BitmapFrame]::Create($rtb))
