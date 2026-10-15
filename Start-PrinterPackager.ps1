@@ -2469,7 +2469,7 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, Sys
                     <StackPanel Grid.Row="1" Grid.ColumnSpan="2" Margin="0,10,0,0">
                         <StackPanel Orientation="Horizontal">
                             <TextBlock Text="Client" FontWeight="SemiBold" VerticalAlignment="Center" Margin="0,0,8,0"/>
-                            <ComboBox Name="CmbClient" Width="220" DisplayMemberPath="Name"/>
+                            <ComboBox Name="CmbClient" Width="260" DisplayMemberPath="Display"/>
                             <Button Name="BtnNewClient" Content="New" Style="{StaticResource LinkButton}" Margin="12,0,0,0" VerticalAlignment="Center"/>
                             <Button Name="BtnExportClient" Content="Export" Style="{StaticResource LinkButton}" Margin="12,0,0,0" VerticalAlignment="Center"/>
                             <Button Name="BtnImportClient" Content="Import" Style="{StaticResource LinkButton}" Margin="12,0,0,0" VerticalAlignment="Center"/>
@@ -3666,6 +3666,13 @@ function Start-SaveLibrary
     Start-Work -Title $title -Command 'Save-PrinterToLibrary' -Arguments @{ Requests = $requests; LibraryDir = $clientDir } -OnDone {
         param ($result, $failure)
         if ($failure) { Show-Error $failure 'Saving to the library failed'; return }
+        Update-ClientList -Select $Settings.Client
+        if ($script:ExportAfterSave)
+        {
+            if (@($result.Results | Where-Object Status -eq 'Failed').Count) { $script:ExportAfterSave = $false; Show-ResultList $result.Results 'Library'; return }
+            Start-ClientExport
+            return
+        }
         Show-ResultList $result.Results 'Library'
         if ($script:Source -eq 'library') { $script:Overrides.Clear(); Start-PrinterScan }
     }
@@ -4023,6 +4030,7 @@ $ui.BtnNewPrinter.Add_Click({
             param ($result, $failure)
             if ($failure) { Show-Error $failure 'New printer failed'; return }
             $script:ReselectAfterLibrary = $result.Name
+            Update-ClientList -Select $Settings.Client
             if ($script:Source -ne 'library') { $ui.RbSourceLibrary.IsChecked = $true }
             else { Start-PrinterScan }
         }
@@ -4050,8 +4058,12 @@ function Update-ClientList
         $clients = @(Get-ChildItem -LiteralPath $root -Directory | Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'client.json') } | ForEach-Object {
             $info = $null
             try { $info = [IO.File]::ReadAllText((Join-Path $_.FullName 'client.json')) | ConvertFrom-Json } catch { }
+            $count = @(Get-ChildItem -LiteralPath $_.FullName -Directory | Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'printer.json') }).Count
+            $label = if ($info -and $info.Name) { "$($info.Name)" } else { $_.Name }
             [pscustomobject]@{
-                Name      = if ($info -and $info.Name) { "$($info.Name)" } else { $_.Name }
+                Name      = $label
+                Display   = if ($count -eq 1) { "$label  (1 printer)" } else { "$label  ($count printers)" }
+                Count     = $count
                 Folder    = $_.Name
                 Publisher = if ($info -and $info.Publisher) { "$($info.Publisher)" } else { '' }
             }
@@ -4166,24 +4178,39 @@ function Get-ClientDirOrAsk
 
 $ui.BtnNewClient.Add_Click({ try { [void](New-Client) } catch { Show-Error $_ } })
 
-$ui.BtnExportClient.Add_Click({
-    try
+function Start-ClientExport
+{
+    $dir = Get-ClientDir
+    if (-not $dir) { return }
+    $client = $ui.CmbClient.SelectedItem
+    $saved = @(Get-ChildItem -LiteralPath $dir -Directory -ErrorAction SilentlyContinue | Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'printer.json') }).Count
+    $ticked = @($ui.GridPrinters.SelectedItems).Count
+    if ($script:Source -eq 'pc' -and $ticked -and -not $script:ExportAfterSave)
     {
-        $dir = Get-ClientDir
-        if (-not $dir) { return }
-        $dlg = New-Object Microsoft.Win32.SaveFileDialog
-        $dlg.Title = 'Export client'
-        $dlg.Filter = 'Printer Packager client (*.zip)|*.zip'
-        $dlg.FileName = "$($ui.CmbClient.SelectedItem.Folder) printers.zip"
-        if (-not $dlg.ShowDialog($window)) { return }
-        Start-Work -Title "Exporting $($ui.CmbClient.SelectedItem.Name)..." -Command 'Export-ClientProject' -Arguments @{ ClientDir = $dir; ZipPath = $dlg.FileName } -OnDone {
-            param ($result, $failure)
-            if ($failure) { Show-Error $failure 'Export failed'; return }
-            [void][Windows.MessageBox]::Show($window, "Exported to:`n$($result.Zip)`n`nOpen it on another PC with Import.", 'Printer Packager', 'OK', 'Information')
-        }
+        # Ticked printers on this PC are not in the client yet: offer to save them first, then export.
+        $answer = [Windows.MessageBox]::Show($window, "Save the $ticked ticked printer(s) to $($client.Name) first?`n`nExport only takes printers that are saved to the client.", 'Printer Packager', 'YesNoCancel', 'Question')
+        if ("$answer" -eq 'Cancel') { return }
+        if ("$answer" -eq 'Yes') { $script:ExportAfterSave = $true; Start-SaveLibrary; return }
     }
-    catch { Show-Error $_ }
-})
+    $script:ExportAfterSave = $false
+    if (-not $saved)
+    {
+        [void][Windows.MessageBox]::Show($window, "$($client.Name) has no printers yet.`n`nTick printers under This PC and click Save to library (or use + New printer), then export.", 'Printer Packager', 'OK', 'Information')
+        return
+    }
+    $dlg = New-Object Microsoft.Win32.SaveFileDialog
+    $dlg.Title = 'Export client'
+    $dlg.Filter = 'Printer Packager client (*.zip)|*.zip'
+    $dlg.FileName = "$($client.Folder) printers.zip"
+    if (-not $dlg.ShowDialog($window)) { return }
+    $script:ExportCount = $saved
+    Start-Work -Title "Exporting $($client.Name)..." -Command 'Export-ClientProject' -Arguments @{ ClientDir = $dir; ZipPath = $dlg.FileName } -OnDone {
+        param ($result, $failure)
+        if ($failure) { Show-Error $failure 'Export failed'; return }
+        [void][Windows.MessageBox]::Show($window, "Exported $($script:ExportCount) printer(s) to:`n$($result.Zip)`n`nOpen it on another PC with Import.", 'Printer Packager', 'OK', 'Information')
+    }
+}
+$ui.BtnExportClient.Add_Click({ try { Start-ClientExport } catch { Show-Error $_ } })
 
 function Start-ClientImport
 {
