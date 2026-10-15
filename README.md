@@ -24,13 +24,31 @@ Publishing the same printer again updates that app and raises the version.
 
 The driver, port, printer preferences and the brand logo are included automatically.
 
+## Clients
+
+At a client site, pick or create the client (top left) and click **Save to library**.
+The printers are saved with driver and settings in that client's folder.
+
+Later, from any PC, switch to **Library**, pick the client and publish.
+The printers don't need to be installed on that PC.
+**Export** and **Import** move a client as one zip file.
+
+**+ New printer** adds a printer that isn't installed anywhere: name, IP, a driver from this PC or from an .inf, settings and logo.
+
+## More
+
+- **Advanced settings** per printer: location, comment, port (RAW/LPR, port number, SNMP), duplex, colour, paper size, and the printer's own driver settings.
+- **Update** checks GitHub for a new version and updates the exe.
+
 ## Notes
 
 - PSAppDeployToolkit 4.1.8 is inside the exe.
 - IntuneWinAppUtil.exe may not be redistributed, so the app downloads it from Microsoft the first time. No internet? Put `IntuneWinAppUtil.exe` next to `PrinterPackager.exe`.
 - Logs on devices: `C:\Windows\Logs\Software`.
 - Settings are remembered per user. Your Intune sign-in is never saved.
-- Publishing needs the Intune Administrator or Application Manager role. The first sign-in asks an admin to allow the app (Microsoft Graph Command Line Tools).
+- Publishing needs the Intune Administrator or Application Manager role. The first sign-in asks an admin to allow the app (Microsoft Graph Command Line Tools). An own app registration can be set as `ClientId` in `%APPDATA%\IntunePrinterPackager\settings.json`.
+- If a driver is already on the device, the install uses it and skips the driver step.
+- Windows protected print mode blocks vendor drivers. The install then stops with a clear message in the log.
 
 ## Build
 
