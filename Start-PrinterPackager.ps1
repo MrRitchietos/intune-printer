@@ -417,7 +417,7 @@ function Export-PrinterPreferences
     $printBrm = Join-Path $env:SystemRoot 'System32\spool\tools\PrintBrm.exe'
     if (-not (Test-Path -LiteralPath $printBrm)) { Write-Log 'PrintBrm.exe is not available on this computer; skipping.' 'WARN'; return $false }
 
-    # C:\Windows\Temp has no spaces, which PrintBrm needs.
+    # PrintBrm takes quotes literally, so it gets space-free paths under C:\Windows\Temp without quotes.
     $work = Join-Path $env:SystemRoot ("Temp\PrinterPackager_" + [guid]::NewGuid().ToString('N').Substring(0, 8))
     $fullCab = Join-Path $work 'full.printerExport'
     $unpacked = Join-Path $work 'unpacked'
@@ -425,10 +425,10 @@ function Export-PrinterPreferences
     try
     {
         New-Item -Path $work -ItemType Directory -Force | Out-Null
-        $r = Invoke-Native -FilePath $printBrm -Arguments "-B -NOBIN -F `"$fullCab`""
+        $r = Invoke-Native -FilePath $printBrm -Arguments "-B -NOBIN -F $fullCab"
         if (-not (Test-Path -LiteralPath $fullCab)) { Write-Log "PrintBrm backup failed (exit $($r.ExitCode)). $($r.Output)" 'WARN'; return $false }
 
-        $r = Invoke-Native -FilePath $printBrm -Arguments "-R -F `"$fullCab`" -D `"$unpacked`""
+        $r = Invoke-Native -FilePath $printBrm -Arguments "-R -F $fullCab -D $unpacked"
         if (-not (Test-Path -LiteralPath $unpacked)) { Write-Log "PrintBrm unpack failed (exit $($r.ExitCode))." 'WARN'; return $false }
 
         $keepFiles = New-Object System.Collections.Generic.List[string]
@@ -475,7 +475,7 @@ function Export-PrinterPreferences
             Get-ChildItem -LiteralPath $printersDir -Filter '*.xml' | Where-Object { -not $keepFiles.Contains($_.Name) } | Remove-Item -Force
         }
 
-        $r = Invoke-Native -FilePath $printBrm -Arguments "-B -NOBIN -F `"$outCab`" -D `"$unpacked`""
+        $r = Invoke-Native -FilePath $printBrm -Arguments "-B -NOBIN -F $outCab -D $unpacked"
         if (-not (Test-Path -LiteralPath $outCab)) { Write-Log "PrintBrm repack failed (exit $($r.ExitCode))." 'WARN'; return $false }
         Copy-Item -LiteralPath $outCab -Destination $DestinationFile -Force
         Write-Log ("Printer settings captured with PrintBrm ({0:N0} KB)." -f ((Get-Item -LiteralPath $DestinationFile).Length / 1KB)) 'OK'
@@ -493,18 +493,24 @@ function Export-PrinterSettingsDat
 {
     # PrintUI /Ss: vendor DevMode (trays, duplex, colour, finishing). /q keeps it from showing a hidden, blocking error box.
     param ([string]$PrinterName, [string]$DestinationFile)
+    $tmp = Join-Path $env:SystemRoot ("Temp\PrinterPackager_" + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.dat')
     try
     {
         $rundll = Join-Path $env:SystemRoot 'System32\rundll32.exe'
-        [void](Invoke-Native -FilePath $rundll -Arguments "printui.dll,PrintUIEntry /Ss /n `"$PrinterName`" /a `"$DestinationFile`" g d /q" -TimeoutSeconds 120)
-        if ((Test-Path -LiteralPath $DestinationFile) -and (Get-Item -LiteralPath $DestinationFile).Length -gt 0)
+        foreach ($flags in 'g d', 'g')
         {
-            Write-Log ("Printer preferences captured with PrintUI ({0:N0} KB)." -f ((Get-Item -LiteralPath $DestinationFile).Length / 1KB)) 'OK'
-            return $true
+            $r = Invoke-Native -FilePath $rundll -Arguments "printui.dll,PrintUIEntry /Ss /n `"$PrinterName`" /a $tmp $flags /q" -TimeoutSeconds 120
+            if ((Test-Path -LiteralPath $tmp) -and (Get-Item -LiteralPath $tmp).Length -gt 0)
+            {
+                Copy-Item -LiteralPath $tmp -Destination $DestinationFile -Force
+                Write-Log ("Printer preferences captured with PrintUI ({0:N0} KB)." -f ((Get-Item -LiteralPath $DestinationFile).Length / 1KB)) 'OK'
+                return $true
+            }
         }
-        Write-Log 'PrintUI did not produce a settings file; skipping.' 'WARN'
+        Write-Log "PrintUI did not produce a settings file (exit $($r.ExitCode)); skipping." 'WARN'
     }
     catch { Write-Log "PrintUI export failed: $($_.Exception.Message)" 'WARN' }
+    finally { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
     return $false
 }
 

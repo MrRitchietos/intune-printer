@@ -42,7 +42,7 @@ try
         if (Get-PrinterDriver -Name $d -ErrorAction SilentlyContinue) { $driver = $d; break }
     }
     Assert $driver "driver available ($driver)"
-    if (Get-TestPrinter) { Remove-Printer -Name $printerName }
+    if (Get-TestPrinter) { Get-TestPrinter | Remove-Printer }
     if (-not (Get-PrinterPort -Name $portName -ErrorAction SilentlyContinue)) { Add-PrinterPort -Name $portName -PrinterHostAddress $host1 }
     Add-Printer -Name $printerName -DriverName $driver -PortName $portName -Location 'CI rack' -Comment 'End-to-end test'
     Assert (Get-TestPrinter) 'test printer created'
@@ -72,7 +72,8 @@ try
     Assert ((Invoke-Detection $detection) -eq 1) 'not detected yet'
 
     Step 'Remove test printer and port'
-    Remove-Printer -Name $printerName
+    Get-TestPrinter | Remove-Printer
+    Start-Sleep -Seconds 2
     Remove-PrinterPort -Name $portName
     Assert (-not (Get-TestPrinter)) 'printer removed'
 
