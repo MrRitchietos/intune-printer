@@ -26,6 +26,15 @@ function Invoke-Detection($path)
     $p = Start-Process -FilePath powershell.exe -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$path`"" -Wait -PassThru -NoNewWindow
     return $p.ExitCode
 }
+function Remove-TestPrinter
+{
+    # A deleted queue can stay pending while the spooler holds a handle; a spooler restart finishes it.
+    Get-TestPrinter | Remove-Printer -ErrorAction SilentlyContinue
+    Restart-Service -Name Spooler -Force
+    Start-Sleep -Seconds 3
+    Get-TestPrinter | Remove-Printer -ErrorAction SilentlyContinue
+    if (Get-PrinterPort -Name $portName -ErrorAction SilentlyContinue) { Remove-PrinterPort -Name $portName }
+}
 function Show-PsadtLogs { Get-ChildItem 'C:\Windows\Logs\Software' -Filter '*.log' -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "--- $($_.FullName)"; Get-Content $_.FullName -Tail 80 } }
 
 try
@@ -42,7 +51,7 @@ try
         if (Get-PrinterDriver -Name $d -ErrorAction SilentlyContinue) { $driver = $d; break }
     }
     Assert $driver "driver available ($driver)"
-    if (Get-TestPrinter) { Get-TestPrinter | Remove-Printer }
+    if (Get-TestPrinter) { Remove-TestPrinter }
     if (-not (Get-PrinterPort -Name $portName -ErrorAction SilentlyContinue)) { Add-PrinterPort -Name $portName -PrinterHostAddress $host1 }
     Add-Printer -Name $printerName -DriverName $driver -PortName $portName -Location 'CI rack' -Comment 'End-to-end test'
     Assert (Get-TestPrinter) 'test printer created'
@@ -72,9 +81,7 @@ try
     Assert ((Invoke-Detection $detection) -eq 1) 'not detected yet'
 
     Step 'Remove test printer and port'
-    Get-TestPrinter | Remove-Printer
-    Start-Sleep -Seconds 2
-    Remove-PrinterPort -Name $portName
+    Remove-TestPrinter
     Assert (-not (Get-TestPrinter)) 'printer removed'
 
     Step 'Install via PSADT (silent, like Intune)'
