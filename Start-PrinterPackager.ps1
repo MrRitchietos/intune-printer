@@ -614,7 +614,7 @@ function Install-PackagedPrinter
                 foreach ($inf in (Get-ChildItem -LiteralPath $stagedDriver -Filter '*.inf' -Recurse))
                 {
                     Write-ADTLogEntry -Message "Adding driver package [$($inf.Name)] to the DriverStore."
-                    $result = Start-ADTProcess -FilePath (Join-Path -Path $system32 -ChildPath 'pnputil.exe') -ArgumentList '/add-driver', $inf.FullName -CreateNoWindow -IgnoreExitCodes '*' -PassThru
+                    $result = Start-ADTProcess -FilePath (Join-Path -Path $system32 -ChildPath 'pnputil.exe') -ArgumentList '/add-driver', $inf.FullName -CreateNoWindow -IgnoreExitCodes '*' -PassThru -Timeout (New-TimeSpan -Minutes 5) -TimeoutAction Continue
                     Write-ADTLogEntry -Message "pnputil exit code [$($result.ExitCode)]."
                 }
             }
@@ -676,7 +676,7 @@ function Install-PackagedPrinter
             Write-ADTLogEntry -Message 'Restoring printer settings with PrintBrm.'
             $stagedExport = Join-Path -Path $staging -ChildPath 'printer.printerExport'
             Copy-Item -LiteralPath $exportFile -Destination $stagedExport -Force
-            $result = Start-ADTProcess -FilePath $printBrm -ArgumentList '-R', '-F', $stagedExport, '-O', 'FORCE' -CreateNoWindow -IgnoreExitCodes '*' -PassThru
+            $result = Start-ADTProcess -FilePath $printBrm -ArgumentList '-R', '-F', $stagedExport, '-O', 'FORCE' -CreateNoWindow -IgnoreExitCodes '*' -PassThru -Timeout (New-TimeSpan -Minutes 5) -TimeoutAction Continue
             Write-ADTLogEntry -Message "PrintBrm exit code [$($result.ExitCode)]."
 
             if ($config.SourcePrinterName -ne $config.PrinterName -and !(Get-PackagedPrinter -Name $config.PrinterName))
@@ -713,7 +713,7 @@ function Install-PackagedPrinter
             Write-ADTLogEntry -Message 'Restoring printer preferences with PrintUI.'
             $stagedDat = Join-Path -Path $staging -ChildPath 'printer_settings.dat'
             Copy-Item -LiteralPath $settingsDat -Destination $stagedDat -Force
-            Start-ADTProcess -FilePath (Join-Path -Path $system32 -ChildPath 'rundll32.exe') -ArgumentList 'printui.dll,PrintUIEntry', '/Sr', '/n', $config.PrinterName, '/a', $stagedDat, 'g', 'd', 'r', '/q' -CreateNoWindow -IgnoreExitCodes '*'
+            Start-ADTProcess -FilePath (Join-Path -Path $system32 -ChildPath 'rundll32.exe') -ArgumentList 'printui.dll,PrintUIEntry', '/Sr', '/n', $config.PrinterName, '/a', $stagedDat, 'g', 'd', 'r', '/q' -CreateNoWindow -IgnoreExitCodes '*' -Timeout (New-TimeSpan -Minutes 2) -TimeoutAction Continue
         }
 
         ## 6. Basic print configuration.
@@ -723,8 +723,19 @@ function Install-PackagedPrinter
         if ($null -ne $config.Color) { $printConfig.Color = [System.Boolean]$config.Color }
         if ($printConfig.Count)
         {
-            try { Set-PrintConfiguration -PrinterName $config.PrinterName @printConfig -ErrorAction Stop }
-            catch { Write-ADTLogEntry -Message "Print configuration not applied: $($_.Exception.Message)" -Severity 2 }
+            # Set-PrintConfiguration can wait on an unreachable printer, so it gets its own process and a time limit.
+            $job = Start-Job -ScriptBlock { param ($Name, $Settings) Set-PrintConfiguration -PrinterName $Name @Settings -ErrorAction Stop } -ArgumentList $config.PrinterName, $printConfig
+            if (Wait-Job -Job $job -Timeout 60)
+            {
+                try { Receive-Job -Job $job -ErrorAction Stop | Out-Null; Write-ADTLogEntry -Message 'Print configuration applied.' }
+                catch { Write-ADTLogEntry -Message "Print configuration not applied: $($_.Exception.Message)" -Severity 2 }
+            }
+            else
+            {
+                Stop-Job -Job $job
+                Write-ADTLogEntry -Message 'Print configuration skipped: no answer within 60 seconds (printer unreachable?).' -Severity 2
+            }
+            Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
         }
 
         ## 7. Default printer (a per-user setting, so it is applied for the signed-in user).
@@ -738,11 +749,11 @@ function Install-PackagedPrinter
             {
                 if ([System.Security.Principal.WindowsIdentity]::GetCurrent().IsSystem)
                 {
-                    Start-ADTProcessAsUser -FilePath (Join-Path -Path $system32 -ChildPath 'rundll32.exe') -ArgumentList $printUi -IgnoreExitCodes '*'
+                    Start-ADTProcessAsUser -FilePath (Join-Path -Path $system32 -ChildPath 'rundll32.exe') -ArgumentList $printUi -IgnoreExitCodes '*' -Timeout (New-TimeSpan -Minutes 1) -TimeoutAction Continue
                 }
                 else
                 {
-                    Start-ADTProcess -FilePath (Join-Path -Path $system32 -ChildPath 'rundll32.exe') -ArgumentList $printUi -IgnoreExitCodes '*'
+                    Start-ADTProcess -FilePath (Join-Path -Path $system32 -ChildPath 'rundll32.exe') -ArgumentList $printUi -IgnoreExitCodes '*' -Timeout (New-TimeSpan -Minutes 1) -TimeoutAction Continue
                 }
                 Write-ADTLogEntry -Message "[$($config.PrinterName)] set as the default printer."
             }
