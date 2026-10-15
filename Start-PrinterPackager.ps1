@@ -1302,6 +1302,17 @@ function Invoke-Graph
             try { $status = [int]$_.Exception.Response.StatusCode } catch { }
             if ($attempt -lt 5 -and ($status -eq 429 -or $status -ge 500)) { Start-Sleep -Seconds (3 * $attempt); continue }
             $detail = "$($_.ErrorDetails.Message)"
+            if (-not $detail)
+            {
+                # Windows PowerShell 5.1 leaves ErrorDetails empty; read the response body ourselves.
+                try
+                {
+                    $reader = New-Object IO.StreamReader($_.Exception.Response.GetResponseStream())
+                    $detail = $reader.ReadToEnd()
+                    $reader.Dispose()
+                }
+                catch { }
+            }
             try { $detail = ($detail | ConvertFrom-Json).error.message } catch { }
             if ($status -eq 403) { $detail = "Access denied. Your account needs the Intune Administrator or Application Manager role, and the tenant must allow 'DeviceManagementApps.ReadWrite.All'. ($detail)" }
             throw "Graph $Method $Path failed ($status): $detail"
@@ -1320,7 +1331,8 @@ function Get-PrinterApps
     # All Win32 apps that Printer Packager published, keyed by printer name.
     param ([hashtable]$Auth)
     $map = @{}
-    $next = "deviceAppManagement/mobileApps?`$filter=isof('microsoft.graph.win32LobApp')&`$select=id,displayName,displayVersion,notes"
+    # Same query as the IntuneWin32App module; Intune rejects $select together with this isof() filter.
+    $next = "deviceAppManagement/mobileApps?`$filter=isof('microsoft.graph.win32LobApp')"
     while ($next)
     {
         $page = Invoke-Graph -Auth $Auth -Path $next
