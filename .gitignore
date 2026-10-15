@@ -19,3 +19,4 @@ build/.work/
 dist/
 src/Launcher/bin/
 src/Launcher/obj/
+e2e/

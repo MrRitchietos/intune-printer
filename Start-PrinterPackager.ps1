@@ -1859,7 +1859,7 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, Sys
                             <DataGridTemplateColumn Width="48" CanUserSort="False">
                                 <DataGridTemplateColumn.CellTemplate>
                                     <DataTemplate>
-                                        <Image Source="{Binding LogoPath}" Width="30" Height="30" RenderOptions.BitmapScalingMode="HighQuality"/>
+                                        <Image Source="{Binding LogoImage}" Width="30" Height="30" RenderOptions.BitmapScalingMode="HighQuality"/>
                                     </DataTemplate>
                                 </DataGridTemplateColumn.CellTemplate>
                             </DataGridTemplateColumn>
@@ -2298,6 +2298,13 @@ $Auth = $null
 function Update-PrinterList
 {
     param ([object[]]$Printers)
+    # Function output is wrapped in a PSObject, which WPF can't show as an image; store the raw bitmap.
+    foreach ($p in $Printers)
+    {
+        $img = [Windows.Media.ImageSource](New-Bitmap $p.LogoPath)
+        $p.PSObject.Properties.Remove('LogoImage')
+        $p.PSObject.Properties.Add([Management.Automation.PSNoteProperty]::new('LogoImage', $img))
+    }
     $script:AllPrinters = @($Printers)
     $view = [Windows.Data.CollectionViewSource]::GetDefaultView($script:AllPrinters)
     $view.Filter = [Predicate[object]]{
