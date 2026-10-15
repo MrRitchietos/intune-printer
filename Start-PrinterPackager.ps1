@@ -1837,7 +1837,7 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, Sys
                         <StackPanel VerticalAlignment="Center">
                             <TextBlock Text="1. Choose a printer" FontSize="14" FontWeight="SemiBold"/>
                             <TextBlock Name="TxtCount" Text="Loading..." Foreground="{StaticResource Muted}" FontSize="12"/>
-                            <TextBlock Text="Tick one or more printers. Each printer becomes its own app." Foreground="{StaticResource Muted}" FontSize="12"/>
+                            <TextBlock Text="Tick one or more printers." Foreground="{StaticResource Muted}" FontSize="12"/>
                         </StackPanel>
                         <Grid Grid.Column="1">
                             <TextBox Name="TxtFilter" Padding="30,6,8,6"/>
