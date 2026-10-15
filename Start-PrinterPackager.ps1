@@ -2310,6 +2310,7 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, Sys
                         <TextBlock x:Name="T" Text="{Binding Content, RelativeSource={RelativeSource TemplatedParent}}" Foreground="{TemplateBinding Foreground}"/>
                         <ControlTemplate.Triggers>
                             <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="T" Property="TextDecorations" Value="Underline"/></Trigger>
+                            <Trigger Property="IsEnabled" Value="False"><Setter TargetName="T" Property="Foreground" Value="#A0A0A0"/></Trigger>
                         </ControlTemplate.Triggers>
                     </ControlTemplate>
                 </Setter.Value>
@@ -2439,6 +2440,10 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, Sys
                         <RowDefinition Height="*"/>
                     </Grid.RowDefinitions>
                     <Grid Margin="18,16,18,12">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                        </Grid.RowDefinitions>
                         <Grid.ColumnDefinitions>
                             <ColumnDefinition Width="*"/>
                             <ColumnDefinition Width="240"/>
@@ -2455,24 +2460,26 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, Sys
                                 <TextBlock Text="Tick one or more printers." Foreground="{StaticResource Muted}" FontSize="12"/>
                                 <Button Name="BtnSelectAll" Content="Select all" Style="{StaticResource LinkButton}" FontSize="12" Margin="8,0,0,0"/>
                             </StackPanel>
-                            <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
-                                <TextBlock Text="Client" FontWeight="SemiBold" VerticalAlignment="Center" Margin="0,0,8,0"/>
-                                <ComboBox Name="CmbClient" Width="200" DisplayMemberPath="Name"/>
-                                <Button Name="BtnNewClient" Content="New" Style="{StaticResource LinkButton}" FontSize="12" Margin="10,0,0,0" VerticalAlignment="Center"/>
-                                <Button Name="BtnExportClient" Content="Export" Style="{StaticResource LinkButton}" FontSize="12" Margin="10,0,0,0" VerticalAlignment="Center"/>
-                                <Button Name="BtnImportClient" Content="Import" Style="{StaticResource LinkButton}" FontSize="12" Margin="10,0,0,0" VerticalAlignment="Center"/>
-                            </StackPanel>
-                            <StackPanel Name="PanelLibraryPath" Orientation="Horizontal" Visibility="Collapsed" Margin="0,4,0,0">
-                                <TextBlock Text="Library folder:" Foreground="{StaticResource Muted}" FontSize="12"/>
-                                <TextBlock Name="TxtLibraryPath" FontSize="12" Margin="4,0,0,0" MaxWidth="300" TextTrimming="CharacterEllipsis"/>
-                                <Button Name="BtnLibraryBrowse" Content="Change..." Style="{StaticResource LinkButton}" FontSize="12" Margin="8,0,0,0"/>
-                            </StackPanel>
                         </StackPanel>
                         <Grid Grid.Column="1" VerticalAlignment="Top">
                             <TextBox Name="TxtFilter" Padding="30,6,8,6"/>
                             <TextBlock Text="&#xE721;" FontFamily="Segoe MDL2 Assets" Foreground="{StaticResource Muted}" Margin="10,0,0,0" VerticalAlignment="Center" IsHitTestVisible="False"/>
                             <TextBlock Name="TxtFilterHint" Text="Search" Foreground="#9E9E9E" Margin="31,0,0,0" VerticalAlignment="Center" IsHitTestVisible="False"/>
                         </Grid>
+                    <StackPanel Grid.Row="1" Grid.ColumnSpan="2" Margin="0,10,0,0">
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="Client" FontWeight="SemiBold" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                            <ComboBox Name="CmbClient" Width="220" DisplayMemberPath="Name"/>
+                            <Button Name="BtnNewClient" Content="New" Style="{StaticResource LinkButton}" Margin="12,0,0,0" VerticalAlignment="Center"/>
+                            <Button Name="BtnExportClient" Content="Export" Style="{StaticResource LinkButton}" Margin="12,0,0,0" VerticalAlignment="Center"/>
+                            <Button Name="BtnImportClient" Content="Import" Style="{StaticResource LinkButton}" Margin="12,0,0,0" VerticalAlignment="Center"/>
+                        </StackPanel>
+                        <StackPanel Name="PanelLibraryPath" Orientation="Horizontal" Visibility="Collapsed" Margin="0,6,0,0">
+                            <TextBlock Text="Library folder:" Foreground="{StaticResource Muted}" FontSize="12"/>
+                            <TextBlock Name="TxtLibraryPath" FontSize="12" Margin="4,0,0,0" MaxWidth="360" TextTrimming="CharacterEllipsis"/>
+                            <Button Name="BtnLibraryBrowse" Content="Change..." Style="{StaticResource LinkButton}" FontSize="12" Margin="8,0,0,0"/>
+                        </StackPanel>
+                    </StackPanel>
                     </Grid>
                     <DataGrid Name="GridPrinters" Grid.Row="1" AutoGenerateColumns="False" IsReadOnly="True" SelectionMode="Extended"
                               HeadersVisibility="Column" GridLinesVisibility="None" BorderThickness="0" Background="White"
