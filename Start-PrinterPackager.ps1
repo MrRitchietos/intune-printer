@@ -2132,8 +2132,10 @@ function Import-ClientProject
     $zip = [IO.Compression.ZipFile]::OpenRead($ZipPath)
     try
     {
-        $first = @($zip.Entries | ForEach-Object { ($_.FullName -replace '\\', '/').Split('/')[0] } | Select-Object -Unique)
-        if ($first.Count -ne 1 -or -not ($zip.Entries | Where-Object { $_.FullName -match '(^|/)client\.json$' })) { throw 'This zip is not a Printer Packager client export.' }
+        # Windows PowerShell writes zip entries with backslashes, newer .NET with slashes.
+        $names = @($zip.Entries | ForEach-Object { $_.FullName -replace '\\', '/' })
+        $first = @($names | ForEach-Object { $_.Split('/')[0] } | Select-Object -Unique)
+        if ($first.Count -ne 1 -or -not ($names -match '^[^/]+/client\.json$')) { throw 'This zip is not a Printer Packager client export.' }
         $name = $first[0]
     }
     finally { $zip.Dispose() }
