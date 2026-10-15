@@ -42,6 +42,7 @@ jobs:
           path: |
             dist/PrinterPackager.exe
             C:/e2e/shots/*.png
+            C:/e2e/out/**/*.intunewin
 
       - name: Release
         if: github.ref_type == 'tag'
