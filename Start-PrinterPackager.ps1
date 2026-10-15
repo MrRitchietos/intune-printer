@@ -1813,7 +1813,7 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, Sys
                             <DataGridTemplateColumn Width="52" CanUserSort="False">
                                 <DataGridTemplateColumn.CellTemplate>
                                     <DataTemplate>
-                                        <Image Source="{Binding LogoPath}" Width="30" Height="30" RenderOptions.BitmapScalingMode="HighQuality"/>
+                                        <Image Source="{Binding LogoImage}" Width="30" Height="30" RenderOptions.BitmapScalingMode="HighQuality"/>
                                     </DataTemplate>
                                 </DataGridTemplateColumn.CellTemplate>
                             </DataGridTemplateColumn>
@@ -2181,6 +2181,8 @@ $CustomLogo = $null
 function Update-PrinterList
 {
     param ([object[]]$Printers)
+    # WPF can't turn a path on a PowerShell object into an image, so each row gets a ready bitmap.
+    foreach ($p in $Printers) { $p | Add-Member -NotePropertyName LogoImage -NotePropertyValue (New-Bitmap $p.LogoPath) -Force }
     $script:AllPrinters = @($Printers)
     $view = [Windows.Data.CollectionViewSource]::GetDefaultView($script:AllPrinters)
     $view.Filter = [Predicate[object]]{
