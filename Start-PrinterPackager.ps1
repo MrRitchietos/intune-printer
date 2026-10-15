@@ -940,7 +940,19 @@ function New-PrinterPackage
 
     Set-Step 'Preparing...' 2
     $template = Resolve-PsadtTemplate
-    $intuneWinUtil = if ($Request.CreateIntuneWin) { Resolve-IntuneWinAppUtil } else { $null }
+    $intuneWinUtil = $null
+    if ($Request.CreateIntuneWin)
+    {
+        try { $intuneWinUtil = Resolve-IntuneWinAppUtil }
+        catch
+        {
+            # Offline "save files": keep going without the .intunewin, but always make the .zip.
+            if (-not $Request.IntuneWinOptional) { throw }
+            Write-Log "$($_.Exception.Message) Saving without .intunewin." 'WARN'
+            $Request.CreateIntuneWin = $false
+            $Request.CreateZip = $true
+        }
+    }
 
     if (Test-Path -LiteralPath $root)
     {
@@ -1302,6 +1314,17 @@ function Invoke-Graph
             try { $status = [int]$_.Exception.Response.StatusCode } catch { }
             if ($attempt -lt 5 -and ($status -eq 429 -or $status -ge 500)) { Start-Sleep -Seconds (3 * $attempt); continue }
             $detail = "$($_.ErrorDetails.Message)"
+            if (-not $detail)
+            {
+                # Windows PowerShell 5.1 leaves ErrorDetails empty; read the response body ourselves.
+                try
+                {
+                    $reader = New-Object IO.StreamReader($_.Exception.Response.GetResponseStream())
+                    $detail = $reader.ReadToEnd()
+                    $reader.Dispose()
+                }
+                catch { }
+            }
             try { $detail = ($detail | ConvertFrom-Json).error.message } catch { }
             if ($status -eq 403) { $detail = "Access denied. Your account needs the Intune Administrator or Application Manager role, and the tenant must allow 'DeviceManagementApps.ReadWrite.All'. ($detail)" }
             throw "Graph $Method $Path failed ($status): $detail"
@@ -1320,7 +1343,8 @@ function Get-PrinterApps
     # All Win32 apps that Printer Packager published, keyed by printer name.
     param ([hashtable]$Auth)
     $map = @{}
-    $next = "deviceAppManagement/mobileApps?`$filter=isof('microsoft.graph.win32LobApp')&`$select=id,displayName,displayVersion,notes"
+    # Same query as the IntuneWin32App module; Intune rejects $select together with this isof() filter.
+    $next = "deviceAppManagement/mobileApps?`$filter=isof('microsoft.graph.win32LobApp')"
     while ($next)
     {
         $page = Invoke-Graph -Auth $Auth -Path $next
@@ -1564,6 +1588,33 @@ function Publish-Printers
     Set-Step 'Done.' 100
     return [pscustomobject]@{ __Result = $true; Results = $results.ToArray() }
 }
+
+function Save-Printers
+{
+    # Bulk "save files": one package folder per printer.
+    param ([object[]]$Requests)
+    $results = New-Object System.Collections.Generic.List[object]
+    $n = $Requests.Count
+    for ($i = 0; $i -lt $n; $i++)
+    {
+        $req = $Requests[$i]
+        $name = "$($req.TargetName)".Trim(); if (-not $name) { $name = $req.Printer.Name }
+        $script:ProgressRange = @([int](100 * $i / $n), [int](100 * ($i + 1) / $n))
+        try
+        {
+            $pkg = New-PrinterPackage -Request $req
+            $status = if ($pkg.IntuneWin) { 'Saved' } else { 'SavedNoIntuneWin' }
+            $results.Add([pscustomobject]@{ Printer = $name; Status = $status; Version = $pkg.Version; Url = ''; Logo = $pkg.Logo; Folder = $pkg.Folder; Error = '' })
+        }
+        catch
+        {
+            Write-Log "$name failed: $($_.Exception.Message)" 'ERROR'
+            $results.Add([pscustomobject]@{ Printer = $name; Status = 'Failed'; Version = ''; Url = ''; Logo = $req.LogoPath; Folder = ''; Error = $_.Exception.Message })
+        }
+        finally { $script:ProgressRange = $null }
+    }
+    return [pscustomobject]@{ __Result = $true; Results = $results.ToArray() }
+}
 #endregion
 
 }
@@ -1767,12 +1818,24 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, Sys
                         <TextBlock Text="Turn an installed printer into an Intune app (PSAppDeployToolkit v4)" Foreground="{StaticResource Muted}"/>
                     </StackPanel>
                 </Border>
-                <Button Name="BtnRefresh" Grid.Column="2" VerticalAlignment="Center">
-                    <StackPanel Orientation="Horizontal">
-                        <TextBlock Text="&#xE72C;" FontFamily="Segoe MDL2 Assets" Margin="0,1,8,0" VerticalAlignment="Center"/>
-                        <TextBlock Text="Refresh printers"/>
+                <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center">
+                    <StackPanel Name="PanelAccount" VerticalAlignment="Center" Margin="0,0,12,0" Visibility="Collapsed">
+                        <TextBlock Name="TxtAccountUser" FontWeight="SemiBold" HorizontalAlignment="Right"/>
+                        <TextBlock Name="TxtAccountTenant" Foreground="{StaticResource Muted}" FontSize="12" HorizontalAlignment="Right"/>
                     </StackPanel>
-                </Button>
+                    <Button Name="BtnSignIn" Margin="0,0,10,0">
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="&#xE77B;" FontFamily="Segoe MDL2 Assets" Margin="0,1,8,0" VerticalAlignment="Center"/>
+                            <TextBlock Name="TxtSignIn" Text="Sign in to Intune"/>
+                        </StackPanel>
+                    </Button>
+                    <Button Name="BtnRefresh">
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="&#xE72C;" FontFamily="Segoe MDL2 Assets" Margin="0,1,8,0" VerticalAlignment="Center"/>
+                            <TextBlock Text="Refresh"/>
+                        </StackPanel>
+                    </Button>
+                </StackPanel>
             </Grid>
         </Border>
 
@@ -1799,6 +1862,7 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, Sys
                         <StackPanel VerticalAlignment="Center">
                             <TextBlock Text="1. Choose a printer" FontSize="14" FontWeight="SemiBold"/>
                             <TextBlock Name="TxtCount" Text="Loading..." Foreground="{StaticResource Muted}" FontSize="12"/>
+                            <TextBlock Text="Tick one or more printers." Foreground="{StaticResource Muted}" FontSize="12"/>
                         </StackPanel>
                         <Grid Grid.Column="1">
                             <TextBox Name="TxtFilter" Padding="30,6,8,6"/>
@@ -1806,11 +1870,18 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, Sys
                             <TextBlock Name="TxtFilterHint" Text="Search" Foreground="#9E9E9E" Margin="31,0,0,0" VerticalAlignment="Center" IsHitTestVisible="False"/>
                         </Grid>
                     </Grid>
-                    <DataGrid Name="GridPrinters" Grid.Row="1" AutoGenerateColumns="False" IsReadOnly="True" SelectionMode="Single"
+                    <DataGrid Name="GridPrinters" Grid.Row="1" AutoGenerateColumns="False" IsReadOnly="True" SelectionMode="Extended"
                               HeadersVisibility="Column" GridLinesVisibility="None" BorderThickness="0" Background="White"
                               RowHeight="48" CanUserResizeRows="False" CanUserReorderColumns="False" HorizontalScrollBarVisibility="Disabled" Margin="8,0,8,8">
                         <DataGrid.Columns>
-                            <DataGridTemplateColumn Width="52" CanUserSort="False">
+                            <DataGridTemplateColumn Width="40" CanUserSort="False">
+                                <DataGridTemplateColumn.CellTemplate>
+                                    <DataTemplate>
+                                        <CheckBox Margin="0" Focusable="False" VerticalAlignment="Center" IsChecked="{Binding IsSelected, Mode=TwoWay, RelativeSource={RelativeSource AncestorType=DataGridRow}}"/>
+                                    </DataTemplate>
+                                </DataGridTemplateColumn.CellTemplate>
+                            </DataGridTemplateColumn>
+                            <DataGridTemplateColumn Width="48" CanUserSort="False">
                                 <DataGridTemplateColumn.CellTemplate>
                                     <DataTemplate>
                                         <Image Source="{Binding LogoImage}" Width="30" Height="30" RenderOptions.BitmapScalingMode="HighQuality"/>
@@ -1841,7 +1912,28 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, Sys
                 <Grid>
                     <ScrollViewer Name="PanelSettings" VerticalScrollBarVisibility="Auto" Visibility="Collapsed">
                         <StackPanel Margin="18,16,18,18">
-                            <TextBlock Text="2. Check the package" Style="{StaticResource SectionTitle}"/>
+                            <TextBlock Name="TxtPanelTitle" Text="2. Check the package" Style="{StaticResource SectionTitle}"/>
+                            <StackPanel Name="PanelMulti" Visibility="Collapsed">
+                                <ItemsControl Name="ListMulti">
+                                    <ItemsControl.ItemTemplate>
+                                        <DataTemplate>
+                                            <Grid Margin="0,0,0,8">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                    <ColumnDefinition Width="*"/>
+                                                </Grid.ColumnDefinitions>
+                                                <Image Source="{Binding Logo}" Width="30" Height="30" RenderOptions.BitmapScalingMode="HighQuality" VerticalAlignment="Top"/>
+                                                <StackPanel Grid.Column="1" Margin="10,0,0,0">
+                                                    <TextBlock Text="{Binding Name}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/>
+                                                    <TextBlock Text="{Binding Detail}" Foreground="{Binding DetailColor}" FontSize="12" TextTrimming="CharacterEllipsis"/>
+                                                </StackPanel>
+                                            </Grid>
+                                        </DataTemplate>
+                                    </ItemsControl.ItemTemplate>
+                                </ItemsControl>
+                                <TextBlock Text="Click a single printer to change its name, IP or logo." Foreground="{StaticResource Muted}" FontSize="12" TextWrapping="Wrap" Margin="0,2,0,0"/>
+                            </StackPanel>
+                            <StackPanel Name="PanelSingle">
                             <Grid Margin="0,0,0,14">
                                 <Grid.ColumnDefinitions>
                                     <ColumnDefinition Width="Auto"/>
@@ -1865,6 +1957,7 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, Sys
                             <TextBlock Text="IP address or hostname" Style="{StaticResource Label}"/>
                             <TextBox Name="TxtHost"/>
                             <TextBlock Name="TxtHostHint" Foreground="#B54700" FontSize="12" TextWrapping="Wrap" Margin="0,4,0,0" Visibility="Collapsed"/>
+                            </StackPanel>
 
                             <Border BorderBrush="{StaticResource Line}" BorderThickness="0,1,0,0" Margin="0,16,0,14"/>
                             <TextBlock Text="Intune app" Style="{StaticResource SectionTitle}"/>
@@ -1883,8 +1976,10 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, Sys
                                     <TextBox Name="TxtVersion" Text="1.0.0"/>
                                 </StackPanel>
                             </Grid>
-                            <TextBlock Text="App name" Style="{StaticResource Label}" Margin="0,10,0,4"/>
-                            <TextBox Name="TxtAppName"/>
+                            <StackPanel Name="PanelAppName">
+                                <TextBlock Text="App name" Style="{StaticResource Label}" Margin="0,10,0,4"/>
+                                <TextBox Name="TxtAppName"/>
+                            </StackPanel>
 
                             <Border BorderBrush="{StaticResource Line}" BorderThickness="0,1,0,0" Margin="0,16,0,14"/>
                             <TextBlock Text="Options" Style="{StaticResource SectionTitle}"/>
@@ -1896,7 +1991,7 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, Sys
                     </ScrollViewer>
                     <StackPanel Name="PanelNoSelection" VerticalAlignment="Center" HorizontalAlignment="Center" Margin="30">
                         <TextBlock Text="&#xE749;" FontFamily="Segoe MDL2 Assets" FontSize="40" Foreground="#C8C8C8" HorizontalAlignment="Center"/>
-                        <TextBlock Text="Select a printer on the left" FontSize="14" FontWeight="SemiBold" HorizontalAlignment="Center" Margin="0,12,0,4"/>
+                        <TextBlock Text="Tick a printer on the left" FontSize="14" FontWeight="SemiBold" HorizontalAlignment="Center" Margin="0,12,0,4"/>
                         <TextBlock Text="Its driver, port, preferences and logo are packaged for you." Foreground="{StaticResource Muted}" TextWrapping="Wrap" TextAlignment="Center"/>
                     </StackPanel>
                 </Grid>
@@ -1923,8 +2018,8 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, Sys
                     <Button Name="BtnBrowseOutput" Grid.Column="1" Content="Browse..." Margin="8,0,0,0"/>
                     <Button Name="BtnOpenOutput" Grid.Column="2" Content="Open" Margin="8,0,0,0"/>
                 </Grid>
-                <Button Name="BtnPackageLocal" Grid.Column="2" Content="Create .zip only" Margin="24,0,10,0" Padding="16,9"/>
-                <Button Name="BtnPackage" Grid.Column="3" Style="{StaticResource AccentButton}" Content="Create Intune package"/>
+                <Button Name="BtnPackageLocal" Grid.Column="2" Content="Save files only" Margin="24,0,10,0" Padding="16,9"/>
+                <Button Name="BtnPackage" Grid.Column="3" Style="{StaticResource AccentButton}" Content="Publish to Company Portal"/>
             </Grid>
         </Border>
 
@@ -1962,6 +2057,42 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, Sys
                     <TextBlock Name="TxtBusyTitle" FontSize="16" FontWeight="SemiBold" HorizontalAlignment="Center" TextAlignment="Center" TextWrapping="Wrap"/>
                     <TextBlock Name="TxtBusyStep" Foreground="{StaticResource Muted}" HorizontalAlignment="Center" TextAlignment="Center" TextWrapping="Wrap" Margin="0,6,0,16"/>
                     <ProgressBar Name="PrgBusy" Height="4" Foreground="#C80032" Background="#F4D3DC" BorderThickness="0" IsIndeterminate="True"/>
+                </StackPanel>
+            </Border>
+
+            <!-- Result list card (bulk / publish) -->
+            <Border Name="ResultListCard" Style="{StaticResource Card}" Width="640" HorizontalAlignment="Center" VerticalAlignment="Center" Padding="28,24" Visibility="Collapsed">
+                <Border.Effect><DropShadowEffect BlurRadius="24" ShadowDepth="4" Opacity="0.15"/></Border.Effect>
+                <StackPanel>
+                    <TextBlock Name="TxtResultListTitle" FontSize="18" FontWeight="SemiBold"/>
+                    <TextBlock Name="TxtResultListSub" Foreground="{StaticResource Muted}" TextWrapping="Wrap" Margin="0,4,0,16"/>
+                    <ScrollViewer MaxHeight="380" VerticalScrollBarVisibility="Auto">
+                        <ItemsControl Name="ListResults">
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate>
+                                    <Border BorderBrush="#EDEDED" BorderThickness="0,0,0,1" Padding="0,8">
+                                        <Grid>
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="Auto"/>
+                                                <ColumnDefinition Width="*"/>
+                                                <ColumnDefinition Width="Auto"/>
+                                            </Grid.ColumnDefinitions>
+                                            <Image Source="{Binding Logo}" Width="34" Height="34" RenderOptions.BitmapScalingMode="HighQuality" VerticalAlignment="Top"/>
+                                            <StackPanel Grid.Column="1" Margin="12,0,12,0">
+                                                <TextBlock Text="{Binding Printer}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/>
+                                                <TextBlock Text="{Binding Detail}" Foreground="{Binding DetailColor}" FontSize="12" TextWrapping="Wrap"/>
+                                            </StackPanel>
+                                            <Button Grid.Column="2" Content="{Binding LinkText}" Tag="{Binding Url}" Visibility="{Binding LinkVisibility}" Style="{StaticResource LinkButton}" VerticalAlignment="Center"/>
+                                        </Grid>
+                                    </Border>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+                    </ScrollViewer>
+                    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,18,0,0">
+                        <Button Name="BtnResultListOpen" Content="Open folder" Margin="0,0,10,0"/>
+                        <Button Name="BtnResultListClose" Style="{StaticResource AccentButton}" Content="Done"/>
+                    </StackPanel>
                 </StackPanel>
             </Border>
 
@@ -2014,6 +2145,15 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, Sys
 $window = [Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $xaml))
 $ui = @{}
 foreach ($node in $xaml.SelectNodes('//*[@Name]')) { $ui[$node.Name] = $window.FindName($node.Name) }
+
+# Raw .NET values for data binding (PowerShell's PSObject wrapper breaks image/brush bindings).
+function ConvertTo-Brush
+{
+    param ([string]$Color)
+    $brush = [Windows.Media.Brush](New-Object Windows.Media.BrushConverter).ConvertFromString($Color)
+    $brush.Freeze()
+    return , $brush
+}
 
 function New-Bitmap
 {
@@ -2078,8 +2218,9 @@ function Save-Settings
 #region Background jobs
 $Sync = [hashtable]::Synchronized(@{
     Log     = New-Object 'System.Collections.Concurrent.ConcurrentQueue[string]'
-    Step    = ''
-    Percent = -1
+    Step       = ''
+    Percent    = -1
+    DeviceCode = $null
 })
 $Job = $null
 $WorkerBootstrap = @'
@@ -2163,6 +2304,13 @@ $timer.Add_Tick({
         if ($script:Job)
         {
             $ui.TxtBusyStep.Text = $Sync.Step
+            if ($Sync.DeviceCode)
+            {
+                [Windows.Clipboard]::SetText($Sync.DeviceCode)
+                Start-Process 'https://microsoft.com/devicelogin'
+                $Sync.DeviceCode = $null
+                $ui.TxtBusyStep.Text = $Sync.Step + '  (code copied, paste it in the browser)'
+            }
             $pct = [int]$Sync.Percent
             if ($pct -ge 0) { $ui.PrgBusy.IsIndeterminate = $false; $ui.PrgBusy.Value = $pct } else { $ui.PrgBusy.IsIndeterminate = $true }
             if ($script:Job.Handle.IsCompleted) { Complete-Work }
@@ -2176,7 +2324,10 @@ $timer.Add_Tick({
 $AllPrinters = @()
 $LogoItems = @(Get-LogoList)
 $ui.CmbLogo.ItemsSource = $LogoItems
-$CustomLogo = $null
+$Overrides = @{}
+$CurrentPrinter = $null
+$Loading = $false
+$Auth = $null
 
 function Update-PrinterList
 {
@@ -2203,25 +2354,47 @@ function Update-PrinterList
 
 function Start-PrinterScan
 {
-    $script:ReselectName = if ($ui.GridPrinters.SelectedItem) { $ui.GridPrinters.SelectedItem.Name } else { $null }
+    $script:ReselectNames = @($ui.GridPrinters.SelectedItems | ForEach-Object { $_.Name })
     Start-Work -Title 'Loading printers...' -Command 'Get-PrinterInventory' -OnDone {
         param ($result, $failure)
         if ($failure) { Show-Error $failure 'Could not read the printers'; return }
         Update-PrinterList $result.Printers
-        if ($script:ReselectName)
-        {
-            $match = $script:AllPrinters | Where-Object { $_.Name -eq $script:ReselectName } | Select-Object -First 1
-            if ($match) { $ui.GridPrinters.SelectedItem = $match; $ui.GridPrinters.ScrollIntoView($match) }
-        }
+        foreach ($p in $script:AllPrinters) { if ($script:ReselectNames -contains $p.Name) { [void]$ui.GridPrinters.SelectedItems.Add($p) } }
         if ($Screenshot) { Invoke-ScreenshotReady }
     }
 }
 
-$LastAutoAppName = ''
+# Per-printer edits (name, IP, logo, app name) are kept while switching between printers.
+function Get-PrinterSettings
+{
+    param ($Printer)
+    if (-not $Overrides.ContainsKey($Printer.Name))
+    {
+        $Overrides[$Printer.Name] = @{
+            TargetName  = $Printer.Name
+            HostAddress = $Printer.HostAddress
+            AppName     = "Printer - $($Printer.Name)"
+            LogoPath    = $Printer.LogoPath
+        }
+    }
+    return $Overrides[$Printer.Name]
+}
+
+function Save-CurrentPrinterSettings
+{
+    if ($script:Loading -or -not $script:CurrentPrinter) { return }
+    $o = Get-PrinterSettings $script:CurrentPrinter
+    $o.TargetName = $ui.TxtTargetName.Text
+    $o.HostAddress = $ui.TxtHost.Text
+    $o.AppName = $ui.TxtAppName.Text
+    if ($ui.CmbLogo.SelectedItem) { $o.LogoPath = $ui.CmbLogo.SelectedItem.Path }
+}
+
 function Update-SelectedPrinter
 {
-    $p = $ui.GridPrinters.SelectedItem
-    if (-not $p)
+    $selected = @($ui.GridPrinters.SelectedItems)
+    $script:CurrentPrinter = $null
+    if ($selected.Count -eq 0)
     {
         $ui.PanelSettings.Visibility = 'Collapsed'
         $ui.PanelNoSelection.Visibility = 'Visible'
@@ -2229,24 +2402,60 @@ function Update-SelectedPrinter
     }
     $ui.PanelNoSelection.Visibility = 'Collapsed'
     $ui.PanelSettings.Visibility = 'Visible'
-    $ui.TxtSelName.Text = $p.Name
-    $ui.TxtSelDriver.Text = $p.DriverName
-    $ui.TxtTargetName.Text = $p.Name
-    $ui.TxtHost.Text = $p.HostAddress
-    $script:LastAutoAppName = "Printer - $($p.Name)"
-    $ui.TxtAppName.Text = $script:LastAutoAppName
-    $script:CustomLogo = $null
-    $ui.CmbLogo.ItemsSource = $LogoItems
-    $ui.CmbLogo.SelectedItem = $LogoItems | Where-Object { $_.Path -eq $p.LogoPath } | Select-Object -First 1
-    if ($p.PortKind -eq 'TCP/IP')
+
+    if ($selected.Count -gt 1)
     {
-        $ui.TxtHostHint.Visibility = 'Collapsed'
+        $ui.TxtPanelTitle.Text = "2. $($selected.Count) printers selected"
+        $ui.PanelSingle.Visibility = 'Collapsed'
+        $ui.PanelAppName.Visibility = 'Collapsed'
+        $ui.PanelMulti.Visibility = 'Visible'
+        $ui.ListMulti.ItemsSource = @(foreach ($p in $selected)
+        {
+            $o = Get-PrinterSettings $p
+            $ip = "$($o.HostAddress)".Trim()
+            [pscustomobject]@{
+                Name        = $o.TargetName
+                Logo        = [Windows.Media.ImageSource](New-Bitmap $o.LogoPath)
+                Detail      = [string]$(if ($ip) { "$ip  -  $($p.DriverName)" } else { 'No IP address: click it to enter one' })
+                DetailColor = [Windows.Media.Brush](ConvertTo-Brush $(if ($ip) { '#616161' } else { '#B54700' }))
+            }
+        })
+        return
     }
-    else
+
+    $p = $selected[0]
+    $o = Get-PrinterSettings $p
+    $script:Loading = $true
+    try
     {
-        $ui.TxtHostHint.Text = "This printer uses a $($p.PortKind) port. Enter its IP address or hostname so other devices can reach it."
-        $ui.TxtHostHint.Visibility = 'Visible'
+        $ui.TxtPanelTitle.Text = '2. Check the package'
+        $ui.PanelMulti.Visibility = 'Collapsed'
+        $ui.PanelSingle.Visibility = 'Visible'
+        $ui.PanelAppName.Visibility = 'Visible'
+        $ui.TxtSelName.Text = $p.Name
+        $ui.TxtSelDriver.Text = $p.DriverName
+        $ui.TxtTargetName.Text = $o.TargetName
+        $ui.TxtHost.Text = $o.HostAddress
+        $ui.TxtAppName.Text = $o.AppName
+        $items = @($LogoItems)
+        $match = $items | Where-Object { $_.Path -eq $o.LogoPath } | Select-Object -First 1
+        if (-not $match)
+        {
+            $match = [pscustomobject]@{ Name = "Own: $([IO.Path]::GetFileNameWithoutExtension($o.LogoPath))"; Path = $o.LogoPath }
+            $items += $match
+        }
+        $ui.CmbLogo.ItemsSource = $items
+        $ui.CmbLogo.SelectedItem = $match
+        $ui.ImgLogo.Source = New-Bitmap $o.LogoPath
+        if ($p.PortKind -eq 'TCP/IP') { $ui.TxtHostHint.Visibility = 'Collapsed' }
+        else
+        {
+            $ui.TxtHostHint.Text = "This printer uses a $($p.PortKind) port. Enter its IP address or hostname so other devices can reach it."
+            $ui.TxtHostHint.Visibility = 'Visible'
+        }
     }
+    finally { $script:Loading = $false }
+    $script:CurrentPrinter = $p
 }
 
 $ui.GridPrinters.Add_SelectionChanged({ try { Update-SelectedPrinter } catch { Show-Error $_ } })
@@ -2260,17 +2469,75 @@ $ui.TxtFilter.Add_TextChanged({
     catch { Show-Error $_ }
 })
 $ui.TxtTargetName.Add_TextChanged({
-    if ($ui.TxtAppName.Text -eq $script:LastAutoAppName)
-    {
-        $script:LastAutoAppName = "Printer - $($ui.TxtTargetName.Text.Trim())"
-        $ui.TxtAppName.Text = $script:LastAutoAppName
-    }
+    if ($script:Loading -or -not $script:CurrentPrinter) { return }
+    $o = Get-PrinterSettings $script:CurrentPrinter
+    if ($ui.TxtAppName.Text -eq "Printer - $($o.TargetName)") { $ui.TxtAppName.Text = "Printer - $($ui.TxtTargetName.Text.Trim())" }
+    Save-CurrentPrinterSettings
 })
+$ui.TxtHost.Add_TextChanged({ Save-CurrentPrinterSettings })
+$ui.TxtAppName.Add_TextChanged({ Save-CurrentPrinterSettings })
 $ui.CmbLogo.Add_SelectionChanged({
     $item = $ui.CmbLogo.SelectedItem
     $ui.ImgLogo.Source = if ($item) { New-Bitmap $item.Path } else { $null }
+    Save-CurrentPrinterSettings
 })
 $ui.BtnRefresh.Add_Click({ try { Start-PrinterScan } catch { Show-Error $_ } })
+#endregion
+
+#region Intune sign-in
+function Update-AccountUi
+{
+    if ($script:Auth)
+    {
+        $ui.TxtAccountUser.Text = $script:Auth.User
+        $ui.TxtAccountTenant.Text = $script:Auth.TenantName
+        $ui.PanelAccount.Visibility = 'Visible'
+        $ui.TxtSignIn.Text = 'Sign out'
+    }
+    else
+    {
+        $ui.PanelAccount.Visibility = 'Collapsed'
+        $ui.TxtSignIn.Text = 'Sign in to Intune'
+    }
+}
+
+$SignInDone = {
+    param ($result, $failure)
+    if ($failure) { Show-Error $failure 'Sign-in failed'; $script:AfterSignIn = $null; return }
+    $script:Auth = $result.Auth
+    Update-AccountUi
+    if ($script:AfterSignIn) { $next = $script:AfterSignIn; $script:AfterSignIn = $null; & $next }
+}
+
+function Start-SignIn
+{
+    param ([scriptblock]$Then)
+    $script:AfterSignIn = $Then
+    $Sync.DeviceCode = $null
+    Start-Work -Title 'Signing in to Intune...' -Command 'Connect-IntuneBrowser' -OnDone {
+        param ($result, $failure)
+        if ($failure)
+        {
+            $answer = [Windows.MessageBox]::Show($window, "Browser sign-in did not work:`n$failure`n`nSign in with a code instead?", 'Printer Packager', 'YesNo', 'Question')
+            if ("$answer" -eq 'Yes')
+            {
+                Start-Work -Title 'Signing in with a code...' -Command 'Connect-IntuneDeviceCode' -OnDone $SignInDone
+            }
+            else { $script:AfterSignIn = $null }
+            return
+        }
+        & $SignInDone $result $null
+    }
+}
+
+$ui.BtnSignIn.Add_Click({
+    try
+    {
+        if ($script:Auth) { $script:Auth = $null; Update-AccountUi; Write-Log 'Signed out.' }
+        else { Start-SignIn }
+    }
+    catch { Show-Error $_ }
+})
 #endregion
 
 #region Actions
@@ -2322,8 +2589,10 @@ function Show-Result
     $ui.TxtResultUninstall.Text = $Result.UninstallCommand
     $notes = 'Detection: custom script Detection.ps1. Logo: Logo.png. Everything is in the folder, see Intune-Upload-Info.txt.'
     if (-not $Result.DriverIncluded) { $notes += ' The driver is NOT included: devices need it already.' }
+    if (-not $Result.IntuneWin) { $notes += ' No .intunewin was made: IntuneWinAppUtil.exe is not available offline. Put it next to PrinterPackager.exe.' }
     $ui.TxtResultNotes.Text = $notes
     $ui.BusyCard.Visibility = 'Collapsed'
+    $ui.ResultListCard.Visibility = 'Collapsed'
     $ui.ResultCard.Visibility = 'Visible'
     $ui.Overlay.Visibility = 'Visible'
 }
@@ -2332,37 +2601,117 @@ $ui.BtnCopyUninstall.Add_Click({ [Windows.Clipboard]::SetText($ui.TxtResultUnins
 $ui.BtnResultOpen.Add_Click({ try { Open-Folder $script:LastResult.Folder } catch { Show-Error $_ } })
 $ui.BtnResultClose.Add_Click({ $ui.ResultCard.Visibility = 'Collapsed'; $ui.Overlay.Visibility = 'Collapsed' })
 
-function Start-Package
+function Show-ResultList
 {
-    param ([bool]$Intune)
-    $p = $ui.GridPrinters.SelectedItem
-    if (-not $p) { [void][Windows.MessageBox]::Show($window, 'Select a printer first.', 'Printer Packager', 'OK', 'Information'); return }
-    $logo = $ui.CmbLogo.SelectedItem
-    Save-Settings
-    $request = @{
-        Printer            = $p
-        TargetName         = $ui.TxtTargetName.Text
-        HostAddress        = $ui.TxtHost.Text
-        AppVendor          = $ui.TxtVendor.Text
-        AppName            = $ui.TxtAppName.Text
-        AppVersion         = $ui.TxtVersion.Text
-        LogoPath           = if ($logo) { $logo.Path } else { $p.LogoPath }
-        IncludeDriver      = [bool]$ui.ChkDriver.IsChecked
-        IncludePreferences = [bool]$ui.ChkPrefs.IsChecked
-        SetDefault         = [bool]$ui.ChkDefault.IsChecked
-        CreateIntuneWin    = $Intune
-        CreateZip          = (-not $Intune) -or [bool]$ui.ChkZip.IsChecked
-        OutputDir          = $ui.TxtOutput.Text
+    param ([object[]]$Results, [bool]$Published)
+    $ok = @($Results | Where-Object { $_.Status -ne 'Failed' }).Count
+    $failed = $Results.Count - $ok
+    $ui.TxtResultListTitle.Text = if ($Published) { "Published $ok of $($Results.Count) printer(s)" } else { "Saved $ok of $($Results.Count) printer(s)" }
+    $ui.TxtResultListSub.Text = if ($Published) { 'Users find them in Company Portal (available for all users). It can take a few minutes before they show up.' } else { "Files are in $($ui.TxtOutput.Text)." }
+    if ($failed) { $ui.TxtResultListSub.Text += " $failed failed, see below." }
+    $ui.ListResults.ItemsSource = @(foreach ($r in $Results)
+    {
+        $detail = switch ($r.Status)
+        {
+            'Failed' { $r.Error }
+            'Created' { "New app, version $($r.Version)" }
+            'Updated' { "Existing app updated to version $($r.Version)" }
+            'SavedNoIntuneWin' { "Saved without .intunewin (IntuneWinAppUtil.exe not available offline), version $($r.Version)" }
+            default { "Saved, version $($r.Version)" }
+        }
+        [pscustomobject]@{
+            Printer        = $r.Printer
+            Logo           = [Windows.Media.ImageSource](New-Bitmap $r.Logo)
+            Detail         = [string]$detail
+            DetailColor    = [Windows.Media.Brush](ConvertTo-Brush $(if ($r.Status -eq 'Failed') { '#C42B1C' } else { '#616161' }))
+            Url            = [string]$r.Url
+            LinkText       = 'Open in Intune'
+            LinkVisibility = [Windows.Visibility]$(if ($r.Url) { 'Visible' } else { 'Collapsed' })
+        }
+    })
+    $ui.BusyCard.Visibility = 'Collapsed'
+    $ui.ResultCard.Visibility = 'Collapsed'
+    $ui.ResultListCard.Visibility = 'Visible'
+    $ui.Overlay.Visibility = 'Visible'
+}
+$ui.ListResults.AddHandler([Windows.Controls.Primitives.ButtonBase]::ClickEvent, [Windows.RoutedEventHandler]{
+    param ($s, $e)
+    $url = $e.OriginalSource.Tag
+    if ($url) { Start-Process $url }
+})
+$ui.BtnResultListOpen.Add_Click({ try { Open-Folder $ui.TxtOutput.Text.Trim() } catch { Show-Error $_ } })
+$ui.BtnResultListClose.Add_Click({ $ui.ResultListCard.Visibility = 'Collapsed'; $ui.Overlay.Visibility = 'Collapsed' })
+
+function Get-PackageRequests
+{
+    # One request per ticked printer; returns $null (after telling the user) when something is missing.
+    $selected = @($ui.GridPrinters.SelectedItems)
+    if (-not $selected.Count) { [void][Windows.MessageBox]::Show($window, 'Tick at least one printer first.', 'Printer Packager', 'OK', 'Information'); return $null }
+    $missing = @($selected | Where-Object { -not "$((Get-PrinterSettings $_).HostAddress)".Trim() } | ForEach-Object { $_.Name })
+    if ($missing.Count)
+    {
+        [void][Windows.MessageBox]::Show($window, "These printers have no IP address yet. Click each one and fill it in:`n`n$($missing -join "`n")", 'Printer Packager', 'OK', 'Warning')
+        return $null
     }
+    Save-Settings
+    return @(foreach ($p in $selected)
+    {
+        $o = Get-PrinterSettings $p
+        @{
+            Printer            = $p
+            TargetName         = $o.TargetName
+            HostAddress        = $o.HostAddress
+            AppVendor          = $ui.TxtVendor.Text
+            AppName            = $o.AppName
+            AppVersion         = $ui.TxtVersion.Text
+            LogoPath           = $o.LogoPath
+            IncludeDriver      = [bool]$ui.ChkDriver.IsChecked
+            IncludePreferences = [bool]$ui.ChkPrefs.IsChecked
+            SetDefault         = [bool]$ui.ChkDefault.IsChecked
+            CreateIntuneWin    = $true
+            CreateZip          = [bool]$ui.ChkZip.IsChecked
+            OutputDir          = $ui.TxtOutput.Text
+        }
+    })
+}
+
+function Start-SaveFiles
+{
+    $requests = Get-PackageRequests
+    if (-not $requests) { return }
+    foreach ($r in $requests) { $r.IntuneWinOptional = $true }
     $ui.ExpLog.IsExpanded = $true
-    Start-Work -Title "Packaging $($ui.TxtTargetName.Text.Trim())..." -Command 'New-PrinterPackage' -Arguments @{ Request = $request } -OnDone {
+    if ($requests.Count -eq 1)
+    {
+        Start-Work -Title "Packaging $($requests[0].TargetName)..." -Command 'New-PrinterPackage' -Arguments @{ Request = $requests[0] } -OnDone {
+            param ($result, $failure)
+            if ($failure) { Show-Error $failure 'Packaging failed'; return }
+            Show-Result $result
+        }
+        return
+    }
+    Start-Work -Title "Packaging $($requests.Count) printers..." -Command 'Save-Printers' -Arguments @{ Requests = $requests } -OnDone {
         param ($result, $failure)
         if ($failure) { Show-Error $failure 'Packaging failed'; return }
-        Show-Result $result
+        Show-ResultList $result.Results $false
     }
 }
-$ui.BtnPackage.Add_Click({ try { Start-Package -Intune $true } catch { Show-Error $_ } })
-$ui.BtnPackageLocal.Add_Click({ try { Start-Package -Intune $false } catch { Show-Error $_ } })
+
+function Start-Publish
+{
+    $requests = Get-PackageRequests
+    if (-not $requests) { return }
+    if (-not $script:Auth) { Start-SignIn -Then { Start-Publish }; return }
+    $ui.ExpLog.IsExpanded = $true
+    $title = if ($requests.Count -eq 1) { "Publishing $($requests[0].TargetName)..." } else { "Publishing $($requests.Count) printers..." }
+    Start-Work -Title $title -Command 'Publish-Printers' -Arguments @{ Auth = $script:Auth; Requests = $requests } -OnDone {
+        param ($result, $failure)
+        if ($failure) { Show-Error $failure 'Publishing failed'; return }
+        Show-ResultList $result.Results $true
+    }
+}
+$ui.BtnPackage.Add_Click({ try { Start-Publish } catch { Show-Error $_ } })
+$ui.BtnPackageLocal.Add_Click({ try { Start-SaveFiles } catch { Show-Error $_ } })
 #endregion
 
 #region Screenshot self-test
