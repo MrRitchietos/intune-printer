@@ -199,6 +199,52 @@ try
     Assert ((Invoke-Detection $det2) -eq 1) 'not detected after uninstall'
     if (-not (Get-PrinterDriver -Name $libDriver -ErrorAction SilentlyContinue)) { Add-PrinterDriver -Name $libDriver -ErrorAction SilentlyContinue }
 
+    Step 'New printer (not installed anywhere) + client export/import'
+    # Load the app's worker functions, the same code the window uses.
+    $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot '..\Start-PrinterPackager.ps1'), [ref]$null, [ref]$null)
+    $assign = $ast.FindAll({ $args[0] -is [Management.Automation.Language.AssignmentStatementAst] -and $args[0].Left.Extent.Text -eq '$WorkerCode' }, $true) | Select-Object -First 1
+    $Ctx = @{ LogoDir = (Join-Path $PSScriptRoot '..\assets\logos'); AppRoot = (Join-Path $PSScriptRoot '..') }
+    $Sync = $null
+    . ([scriptblock]::Create($assign.Right.Extent.Text.Trim().TrimStart('{').TrimEnd('}')))
+
+    $pdfInf = (Get-PrinterDriver -Name $libDriver).InfPath
+    $models = Get-InfPrinterModels -InfPath $pdfInf
+    Assert ($models.IsPrinterInf -and ($models.Models.Name -contains $libDriver)) "models read from $(Split-Path -Leaf $pdfInf) ($($models.Models.Count) found)"
+
+    $root = Join-Path $WorkDir 'clients'
+    $client = Join-Path $root 'E2E Client'
+    New-Item -ItemType Directory -Force -Path $client | Out-Null
+    Set-Content -Path (Join-Path $client 'client.json') -Value '{"Name":"E2E Client","Publisher":"E2E Client"}'
+    $newName = 'E2E New Ricoh MP'
+    $env:PRINTERPACKAGER_PACKAGE_INBOX = '1'
+    [void](New-LibraryPrinter -Definition @{ Name = $newName; HostAddress = '10.123.45.69'; DriverName = $libDriver; Location = 'Reception'; Duplex = 'TwoSidedLongEdge'; Protocol = 1; PortNumber = 9100 } -LibraryDir $client)
+    Remove-Item Env:\PRINTERPACKAGER_PACKAGE_INBOX
+    Assert (Test-Path (Join-Path $client "$newName\printer.json")) 'new printer saved in the client'
+    Assert ((Get-FileHash (Join-Path $client "$newName\Logo.png")).Hash -eq (Get-FileHash (Join-Path $PSScriptRoot '..\assets\logos\ricoh.png')).Hash) 'Ricoh logo from the name'
+
+    $zip = Join-Path $WorkDir 'E2E Client printers.zip'
+    [void](Export-ClientProject -ClientDir $client -ZipPath $zip)
+    $root2 = Join-Path $WorkDir 'clients-imported'
+    $imp = Import-ClientProject -ZipPath $zip -LibraryRoot $root2 -Overwrite $false
+    Assert ($imp.Name -eq 'E2E Client' -and (Test-Path (Join-Path $root2 "E2E Client\$newName\capture.json"))) 'client exported and imported'
+    $again = Import-ClientProject -ZipPath $zip -LibraryRoot $root2 -Overwrite $false
+    Assert $again.Exists 'second import asks before replacing'
+
+    Step 'Package the new printer from the imported client and install it as SYSTEM'
+    $out3 = Join-Path $WorkDir 'out-new'
+    $p = Start-Process -FilePath $Exe -ArgumentList '-PrinterName', "`"$newName`"", '-FromLibrary', '-LibraryDir', "`"$(Join-Path $root2 'E2E Client')`"", '-OutputDir', "`"$out3`"" -Wait -PassThru
+    Assert ($p.ExitCode -eq 0) "package new printer exit code 0 (got $($p.ExitCode))"
+    $folder3 = Get-ChildItem $out3 -Directory | Select-Object -First 1
+    $adt3 = Join-Path $folder3.FullName 'Package\Invoke-AppDeployToolkit.exe'
+    $code = Invoke-AsSystem -FilePath $adt3 -Arguments '-DeploymentType Install -DeployMode Silent'
+    Assert ($code -eq 0) "new printer SYSTEM install exit code 0 (got $code)"
+    $np = Get-Printer | Where-Object Name -eq $newName
+    Assert ($np -and $np.Location -eq 'Reception' -and $np.PortName -eq 'IP_10.123.45.69') 'new printer installed with its settings'
+    Assert ((Invoke-Detection (Join-Path $folder3.FullName 'Detection.ps1')) -eq 0) 'new printer detected'
+    $code = Invoke-AsSystem -FilePath $adt3 -Arguments '-DeploymentType Uninstall -DeployMode Silent'
+    Assert ($code -eq 0 -and -not (Get-Printer | Where-Object Name -eq $newName)) 'new printer uninstalled'
+    if (-not (Get-PrinterDriver -Name $libDriver -ErrorAction SilentlyContinue)) { Add-PrinterDriver -Name $libDriver -ErrorAction SilentlyContinue }
+
     Step 'GUI screenshots'
     if (-not (Get-PrinterDriver -Name $driver -ErrorAction SilentlyContinue)) { Add-PrinterDriver -Name $driver }
     Add-PrinterPort -Name $portName -PrinterHostAddress $host1 -ErrorAction SilentlyContinue
@@ -207,6 +253,7 @@ try
     if (-not $p.WaitForExit(120000)) { $p.Kill(); throw 'GUI did not close within 2 minutes' }
     Assert (Test-Path "$shots\gui-ready.png") 'ready screenshot saved'
     Assert (Test-Path "$shots\gui-advanced.png") 'advanced settings window opened and saved'
+    Assert (Test-Path "$shots\gui-newprinter.png") 'new printer window opened and saved'
     Write-Host "`nALL E2E CHECKS PASSED" -ForegroundColor Green
 }
 catch
