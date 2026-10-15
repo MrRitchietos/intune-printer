@@ -32,6 +32,10 @@ param
     # Callback from PrinterPackager.exe that closes its splash screen once the window is visible.
     [object]$OnReady,
 
+    # Set by PrinterPackager.exe: its own version and full path (for the update button).
+    [string]$ToolVersion,
+    [string]$LauncherPath,
+
     # Headless mode.
     [string]$PrinterName,
     [string]$OutputDir,
@@ -43,6 +47,11 @@ param
     [switch]$NoIntuneWin,
     [switch]$Zip,
     [switch]$SetDefault,
+
+    # Printer library (headless): -SaveToLibrary stores the printer, -FromLibrary packages the saved one.
+    [string]$LibraryDir,
+    [switch]$SaveToLibrary,
+    [switch]$FromLibrary,
 
     # GUI self-test: saves <path>-loading.png and <path>-ready.png, then closes the window.
     [string]$Screenshot
@@ -86,6 +95,9 @@ $Ctx = @{
     IntuneWinVersion = '1.8.7'
     IntuneWinUrl   = 'https://github.com/microsoft/Microsoft-Win32-Content-Prep-Tool/raw/v1.8.7/IntuneWinAppUtil.exe'
     IntuneWinSha256 = 'C1BA45B5CB939E84AF064BB7FF4B38FB3DFE33C8DC1078FD9B157672EAE671F6'
+    UpdateRepo     = 'MrRitchietos/intune-printer'
+    ToolVersion    = $ToolVersion
+    LauncherPath   = $LauncherPath
 }
 try { New-Item -Path (Split-Path -Parent $Ctx.LogFile) -ItemType Directory -Force | Out-Null } catch { $Ctx.LogFile = $null }
 $Sync = $null
@@ -323,6 +335,7 @@ function Get-PrinterInventory
         $brand = Get-PrinterBrand -Text @($manufacturer, $p.DriverName, $p.Name)
 
         $list.Add([pscustomobject]@{
+            Key            = "pc:$($p.Name)"
             Name           = $p.Name
             DriverName     = $p.DriverName
             Manufacturer   = $manufacturer
@@ -358,7 +371,7 @@ function Export-PrinterDriverFiles
     New-Item -Path $DestinationDir -ItemType Directory -Force | Out-Null
 
     # Built-in Windows drivers (ntprint / prnms) exist on every device and are huge; don't package them.
-    if ($InfPath -and (Split-Path -Leaf $InfPath) -match '^(ntprint4?|prnms\d+)\.inf$')
+    if ($InfPath -and (Split-Path -Leaf $InfPath) -match '^(ntprint4?|prnms\d+)\.inf$' -and $env:PRINTERPACKAGER_PACKAGE_INBOX -ne '1')
     {
         Write-Log "'$DriverName' is a built-in Windows driver; devices already have it."
         return 'INBOX'
@@ -603,9 +616,20 @@ function Install-PackagedPrinter
 
     try
     {
-        ## 1. Driver: add the packaged driver to the DriverStore, then to the spooler.
-        if ($config.DriverFolder)
+        ## 1. Driver: skip completely when this driver is already installed; otherwise stage it, then add it to the spooler.
+        $driverInstalled = [System.Boolean](Get-PrinterDriver -Name $config.DriverName -ErrorAction SilentlyContinue)
+        if ($driverInstalled)
         {
+            Write-ADTLogEntry -Message "Printer driver [$($config.DriverName)] is already installed; using it."
+        }
+        elseif ($config.DriverFolder)
+        {
+            # Windows protected print mode only allows Windows' own drivers; say so instead of failing with a vague error.
+            $wpp = Get-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Printers\WPP' -Name 'WindowsProtectedPrintMode' -ErrorAction SilentlyContinue
+            if ($wpp -and $wpp.WindowsProtectedPrintMode -eq 1)
+            {
+                throw "Windows protected print mode is turned on for this device, which blocks the printer driver [$($config.DriverName)]. Turn it off by policy for this device or use a printer with a built-in Windows driver."
+            }
             $driverPath = Join-Path -Path $adtSession.DirFiles -ChildPath $config.DriverFolder
             if (Test-Path -LiteralPath $driverPath)
             {
@@ -614,13 +638,13 @@ function Install-PackagedPrinter
                 foreach ($inf in (Get-ChildItem -LiteralPath $stagedDriver -Filter '*.inf' -Recurse))
                 {
                     Write-ADTLogEntry -Message "Adding driver package [$($inf.Name)] to the DriverStore."
-                    $result = Start-ADTProcess -FilePath (Join-Path -Path $system32 -ChildPath 'pnputil.exe') -ArgumentList '/add-driver', $inf.FullName -CreateNoWindow -IgnoreExitCodes '*' -PassThru -Timeout (New-TimeSpan -Minutes 5) -TimeoutAction Continue
+                    $result = Start-ADTProcess -FilePath (Join-Path -Path $system32 -ChildPath 'pnputil.exe') -ArgumentList '/add-driver', $inf.FullName -CreateNoWindow -IgnoreExitCodes '*' -PassThru -Timeout (New-TimeSpan -Minutes 10) -TimeoutAction Continue
                     Write-ADTLogEntry -Message "pnputil exit code [$($result.ExitCode)]."
                 }
             }
         }
 
-        if (!(Get-PrinterDriver -Name $config.DriverName -ErrorAction SilentlyContinue))
+        if (!$driverInstalled)
         {
             Write-ADTLogEntry -Message "Adding printer driver [$($config.DriverName)] to the spooler."
             try
@@ -676,7 +700,7 @@ function Install-PackagedPrinter
             Write-ADTLogEntry -Message 'Restoring printer settings with PrintBrm.'
             $stagedExport = Join-Path -Path $staging -ChildPath 'printer.printerExport'
             Copy-Item -LiteralPath $exportFile -Destination $stagedExport -Force
-            $result = Start-ADTProcess -FilePath $printBrm -ArgumentList '-R', '-F', $stagedExport, '-O', 'FORCE' -CreateNoWindow -IgnoreExitCodes '*' -PassThru -Timeout (New-TimeSpan -Minutes 5) -TimeoutAction Continue
+            $result = Start-ADTProcess -FilePath $printBrm -ArgumentList '-R', '-F', $stagedExport, '-O', 'FORCE' -CreateNoWindow -IgnoreExitCodes '*' -PassThru -Timeout (New-TimeSpan -Minutes 10) -TimeoutAction Continue
             Write-ADTLogEntry -Message "PrintBrm exit code [$($result.ExitCode)]."
 
             if ($config.SourcePrinterName -ne $config.PrinterName -and !(Get-PackagedPrinter -Name $config.PrinterName))
@@ -920,6 +944,207 @@ function Write-TextFile
     [IO.File]::WriteAllText($Path, $Content, $encoding)
 }
 
+function Save-PrinterCapture
+{
+    # Captures everything needed to rebuild the printer elsewhere: driver files, PrintBrm export,
+    # PrintUI settings and the basic print configuration. Used for packages and for the printer library.
+    param ($Printer, [string]$Destination, [bool]$IncludeDriver = $true, [bool]$IncludePreferences = $true)
+
+    $p = $Printer
+    New-Item -Path $Destination -ItemType Directory -Force | Out-Null
+    $driverFolder = ''
+    $driverInf = ''
+    $builtInDriver = $false
+    if ($IncludeDriver)
+    {
+        Set-Step "Collecting driver files for '$($p.DriverName)'..." 15
+        $driverDir = Join-Path $Destination 'Driver'
+        $driverInf = Export-PrinterDriverFiles -DriverName $p.DriverName -InfPath $p.InfPath -DestinationDir $driverDir
+        if ($driverInf -eq 'INBOX')
+        {
+            Remove-Item -LiteralPath $driverDir -Recurse -Force -ErrorAction SilentlyContinue
+            $driverInf = ''
+            $builtInDriver = $true
+        }
+        elseif ($driverInf)
+        {
+            $driverFolder = 'Driver'
+            $mb = (Get-ChildItem -LiteralPath $driverDir -Recurse -File | Measure-Object -Property Length -Sum).Sum / 1MB
+            Write-Log ("Driver package collected ({0:N1} MB)." -f $mb) 'OK'
+        }
+        else
+        {
+            Remove-Item -LiteralPath $driverDir -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Log "No driver package found for '$($p.DriverName)'. Devices must already have this driver." 'WARN'
+        }
+    }
+
+    $usePrintBrm = $false
+    $useSettingsDat = $false
+    $duplex = ''; $paper = ''; $color = $null
+    if ($IncludePreferences)
+    {
+        Set-Step 'Capturing printer settings (PrintBrm)...' 35
+        $usePrintBrm = Export-PrinterPreferences -PrinterName $p.Name -PortName $p.PortName -KeepPort ($p.PortKind -eq 'TCP/IP') -DriverName $p.DriverName -DestinationFile (Join-Path $Destination 'printer.printerExport')
+
+        Set-Step 'Capturing printer preferences (PrintUI)...' 50
+        $useSettingsDat = Export-PrinterSettingsDat -PrinterName $p.Name -DestinationFile (Join-Path $Destination 'printer_settings.dat')
+
+        Set-Step 'Reading print configuration...' 55
+        $cfg = Invoke-WithTimeout -Script 'param($Name) Get-PrintConfiguration -PrinterName $Name -ErrorAction Stop' -Parameters @{ Name = $p.Name } -TimeoutSeconds 20
+        $cfg = @($cfg) | Select-Object -First 1
+        if ($cfg)
+        {
+            $duplex = "$($cfg.DuplexingMode)"
+            $paper = "$($cfg.PaperSize)"
+            if ($null -ne $cfg.Color) { $color = [bool]$cfg.Color }
+        }
+        else { Write-Log 'Print configuration could not be read (printer offline?); skipped.' 'WARN' }
+    }
+
+    $capture = [ordered]@{
+        CapturedOn     = (Get-Date).ToString('s')
+        CapturedFrom   = $env:COMPUTERNAME
+        DriverFolder   = $driverFolder
+        DriverInf      = "$driverInf"
+        BuiltInDriver  = $builtInDriver
+        UsePrintBrm    = $usePrintBrm
+        UseSettingsDat = $useSettingsDat
+        DuplexingMode  = $duplex
+        PaperSize      = $paper
+        Color          = $color
+    }
+    Write-TextFile -Path (Join-Path $Destination 'capture.json') -Content ($capture | ConvertTo-Json -Depth 4)
+}
+
+function Save-PrinterToLibrary
+{
+    # One folder per printer: capture.json + captured files, printer.json (printer info + settings), Logo.png.
+    # Entries that already come from the library (printer not on this PC) only get settings and logo updated.
+    param ([object[]]$Requests, [string]$LibraryDir)
+    $ErrorActionPreference = 'Stop'
+    if (-not $LibraryDir) { throw 'Choose a library folder first.' }
+    New-Item -Path $LibraryDir -ItemType Directory -Force | Out-Null
+    $results = New-Object System.Collections.Generic.List[object]
+    $n = $Requests.Count
+    for ($i = 0; $i -lt $n; $i++)
+    {
+        $req = $Requests[$i]
+        $p = $req.Printer
+        $name = "$($req.TargetName)".Trim(); if (-not $name) { $name = $p.Name }
+        $script:ProgressRange = @([int](100 * $i / $n), [int](100 * ($i + 1) / $n))
+        try
+        {
+            if ($name -match '[\\,!]') { throw 'The printer name cannot contain \ , or !.' }
+            $target = Join-Path $LibraryDir (ConvertTo-SafeFileName $name)
+            Set-Step "Saving $name to the library ($($i + 1) of $n)..." 0
+            if ($p.CaptureDir)
+            {
+                if ($p.CaptureDir -ne $target)
+                {
+                    if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Recurse -Force }
+                    # Renamed inside the same library: move, so no duplicate stays behind. From another library: copy.
+                    if ((Split-Path -Parent $p.CaptureDir) -eq $LibraryDir.TrimEnd('\')) { Move-Item -LiteralPath $p.CaptureDir -Destination $target }
+                    else { Copy-Item -LiteralPath $p.CaptureDir -Destination $target -Recurse -Force }
+                }
+            }
+            else
+            {
+                $tmp = "$target.saving"
+                if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Recurse -Force }
+                Save-PrinterCapture -Printer $p -Destination $tmp -IncludeDriver ([bool]$req.IncludeDriver) -IncludePreferences ([bool]$req.IncludePreferences)
+                if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Recurse -Force }
+                Move-Item -LiteralPath $tmp -Destination $target
+            }
+            $logoNew = Join-Path $target 'Logo.new.png'
+            Convert-LogoToIcon -Source $req.LogoPath -Destination $logoNew
+            Move-Item -LiteralPath $logoNew -Destination (Join-Path $target 'Logo.png') -Force
+
+            $printerInfo = [ordered]@{}
+            foreach ($prop in 'Name', 'DriverName', 'Manufacturer', 'PortName', 'PortKind', 'HostAddress', 'Protocol', 'PortNumber', 'LprQueueName', 'SnmpEnabled', 'SnmpCommunity', 'SnmpIndex', 'Location', 'Comment', 'Brand')
+            {
+                $printerInfo[$prop] = $p.$prop
+            }
+            if ($p.SourceName) { $printerInfo.Name = $p.SourceName }
+            $entry = [ordered]@{
+                SchemaVersion = 1
+                SavedOn       = (Get-Date).ToString('s')
+                SavedBy       = "$env:USERDOMAIN\$env:USERNAME on $env:COMPUTERNAME"
+                Printer       = $printerInfo
+                Settings      = [ordered]@{
+                    TargetName  = $name
+                    HostAddress = "$($req.HostAddress)".Trim()
+                    AppName     = "$($req.AppName)"
+                    Advanced    = $req.Advanced
+                }
+            }
+            Write-TextFile -Path (Join-Path $target 'printer.json') -Content ($entry | ConvertTo-Json -Depth 6)
+            Write-Log "Saved '$name' to the library." 'OK'
+            $results.Add([pscustomobject]@{ Printer = $name; Status = 'Library'; Version = ''; Url = ''; Logo = (Join-Path $target 'Logo.png'); Folder = $target; Error = '' })
+        }
+        catch
+        {
+            Write-Log "$name failed: $($_.Exception.Message)" 'ERROR'
+            $results.Add([pscustomobject]@{ Printer = $name; Status = 'Failed'; Version = ''; Url = ''; Logo = $req.LogoPath; Folder = ''; Error = $_.Exception.Message })
+        }
+        finally { $script:ProgressRange = $null }
+    }
+    Set-Step 'Done.' 100
+    return [pscustomobject]@{ __Result = $true; Results = $results.ToArray() }
+}
+
+function Get-PrinterLibrary
+{
+    param ([string]$LibraryDir)
+    Set-Step 'Reading the printer library...'
+    $items = New-Object System.Collections.Generic.List[object]
+    if ($LibraryDir -and (Test-Path -LiteralPath $LibraryDir))
+    {
+        foreach ($dir in (Get-ChildItem -LiteralPath $LibraryDir -Directory | Where-Object { $_.Name -notlike '*.saving' }))
+        {
+            $file = Join-Path $dir.FullName 'printer.json'
+            if (-not (Test-Path -LiteralPath $file) -or -not (Test-Path -LiteralPath (Join-Path $dir.FullName 'capture.json'))) { continue }
+            try
+            {
+                $entry = [IO.File]::ReadAllText($file) | ConvertFrom-Json
+                $info = $entry.Printer
+                $logo = Join-Path $dir.FullName 'Logo.png'
+                if (-not (Test-Path -LiteralPath $logo)) { $logo = Join-Path $Ctx.LogoDir (Get-PrinterBrand -Text @($info.Manufacturer, $info.DriverName, $info.Name)).File }
+                $address = if ($entry.Settings.HostAddress) { "$($entry.Settings.HostAddress)" } else { "$($info.HostAddress)" }
+                $items.Add([pscustomobject]@{
+                    Key           = "lib:$($dir.Name)"
+                    Name          = "$($entry.Settings.TargetName)"
+                    DriverName    = "$($info.DriverName)"
+                    Manufacturer  = "$($info.Manufacturer)"
+                    PortName      = "$($info.PortName)"
+                    PortKind      = "$($info.PortKind)"
+                    HostAddress   = "$($info.HostAddress)"
+                    Address       = $address
+                    Protocol      = [int]$info.Protocol
+                    PortNumber    = [int]$info.PortNumber
+                    LprQueueName  = "$($info.LprQueueName)"
+                    SnmpEnabled   = [bool]$info.SnmpEnabled
+                    SnmpCommunity = "$($info.SnmpCommunity)"
+                    SnmpIndex     = [int]$info.SnmpIndex
+                    Location      = "$($info.Location)"
+                    Comment       = "$($info.Comment)"
+                    InfPath       = ''
+                    Brand         = "$($info.Brand)"
+                    LogoPath      = $logo
+                    CaptureDir    = $dir.FullName
+                    SourceName    = "$($info.Name)"
+                    SavedSettings = $entry.Settings
+                    SavedOn       = "$($entry.SavedOn)"
+                })
+            }
+            catch { Write-Log "Library entry '$($dir.Name)' could not be read: $($_.Exception.Message)" 'WARN' }
+        }
+    }
+    $sorted = @($items | Sort-Object Name)
+    Write-Log "Library: $($sorted.Count) printer(s) in $LibraryDir" 'OK'
+    return [pscustomobject]@{ __Result = $true; Printers = $sorted }
+}
+
 function New-PrinterPackage
 {
     param ([hashtable]$Request)
@@ -940,8 +1165,25 @@ function New-PrinterPackage
     $hostAddress = "$($Request.HostAddress)".Trim()
     if (-not $hostAddress) { throw "Enter the IP address or hostname of '$($p.Name)'. It uses a $($p.PortKind) port, which can't be recreated on other devices." }
     if ($hostAddress -notmatch '^[A-Za-z0-9.\-:_\[\]]+$') { throw "'$hostAddress' is not a valid IP address or hostname." }
+    $adv = if ($Request.Advanced) { $Request.Advanced } else { @{} }
     $keepPort = ($p.PortKind -eq 'TCP/IP' -and $hostAddress -eq $p.HostAddress)
-    $portName = if ($keepPort) { $p.PortName } else { "IP_$hostAddress" }
+    $protocol = if ($keepPort) { [int]$p.Protocol } else { 1 }
+    $portNumber = if ($keepPort) { [int]$p.PortNumber } else { 9100 }
+    $lprQueue = if ($keepPort) { "$($p.LprQueueName)" } else { '' }
+    $snmpEnabled = if ($keepPort) { [bool]$p.SnmpEnabled } else { $false }
+    $snmpCommunity = if ($p.SnmpCommunity) { "$($p.SnmpCommunity)" } else { 'public' }
+    if ($adv.Protocol) { $protocol = [int]$adv.Protocol }
+    if ($adv.PortNumber) { $portNumber = [int]$adv.PortNumber }
+    if ($adv.LprQueueName) { $lprQueue = "$($adv.LprQueueName)" }
+    if ($null -ne $adv.SnmpEnabled) { $snmpEnabled = [bool]$adv.SnmpEnabled }
+    if ($adv.SnmpCommunity) { $snmpCommunity = "$($adv.SnmpCommunity)" }
+    $portChanged = $keepPort -and ($protocol -ne [int]$p.Protocol -or $portNumber -ne [int]$p.PortNumber -or $lprQueue -ne "$($p.LprQueueName)")
+    $portName = if ($keepPort -and -not $portChanged) { $p.PortName }
+        elseif ($protocol -eq 2) { "IP_${hostAddress}_LPR" }
+        elseif ($portNumber -ne 9100) { "IP_${hostAddress}_$portNumber" }
+        else { "IP_$hostAddress" }
+    $location = if ($null -ne $adv.Location) { "$($adv.Location)" } else { "$($p.Location)" }
+    $comment = if ($null -ne $adv.Comment) { "$($adv.Comment)" } else { "$($p.Comment)" }
 
     $displayName = "$appVendor - $appName"
     $folderName = ConvertTo-SafeFileName "$appVendor - $appName - $appVersion"
@@ -982,55 +1224,43 @@ function New-PrinterPackage
     Get-ChildItem -LiteralPath $packageDir -Recurse -Filter 'Add * Here.txt' | Remove-Item -Force
     New-Item -Path $filesDir -ItemType Directory -Force | Out-Null
 
-    $driverFolder = ''
-    $driverInf = ''
-    $builtInDriver = $false
-    if ($Request.IncludeDriver)
+    # Use the library capture, or capture the printer on this PC now.
+    $tempCapture = $null
+    if ($Request.CaptureDir)
     {
-        Set-Step "Collecting driver files for '$($p.DriverName)'..." 15
-        $driverDir = Join-Path $filesDir 'Driver'
-        $driverInf = Export-PrinterDriverFiles -DriverName $p.DriverName -InfPath $p.InfPath -DestinationDir $driverDir
-        if ($driverInf -eq 'INBOX')
+        Set-Step 'Using the saved printer from the library...' 15
+        $captureDir = $Request.CaptureDir
+    }
+    else
+    {
+        $tempCapture = Join-Path $env:SystemRoot ("Temp\PrinterPackager_cap_" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        $captureDir = $tempCapture
+        [void](Save-PrinterCapture -Printer $p -Destination $captureDir -IncludeDriver ([bool]$Request.IncludeDriver) -IncludePreferences ([bool]$Request.IncludePreferences))
+    }
+    try
+    {
+        $cap = [IO.File]::ReadAllText((Join-Path $captureDir 'capture.json')) | ConvertFrom-Json
+        foreach ($item in 'Driver', 'printer.printerExport', 'printer_settings.dat')
         {
-            Remove-Item -LiteralPath $driverDir -Recurse -Force -ErrorAction SilentlyContinue
-            $driverInf = ''
-            $builtInDriver = $true
-        }
-        elseif ($driverInf)
-        {
-            $driverFolder = 'Driver'
-            $mb = (Get-ChildItem -LiteralPath $driverDir -Recurse -File | Measure-Object -Property Length -Sum).Sum / 1MB
-            Write-Log ("Driver package collected ({0:N1} MB)." -f $mb) 'OK'
-        }
-        else
-        {
-            Remove-Item -LiteralPath $driverDir -Recurse -Force -ErrorAction SilentlyContinue
-            Write-Log "No driver package found for '$($p.DriverName)'. Devices must already have this driver." 'WARN'
+            $src = Join-Path $captureDir $item
+            if (Test-Path -LiteralPath $src) { Copy-Item -LiteralPath $src -Destination $filesDir -Recurse -Force }
         }
     }
-
-    $usePrintBrm = $false
-    $useSettingsDat = $false
-    $duplex = ''; $paper = ''; $color = $null
-    if ($Request.IncludePreferences)
+    finally
     {
-        Set-Step 'Capturing printer settings (PrintBrm)...' 35
-        $usePrintBrm = Export-PrinterPreferences -PrinterName $p.Name -PortName $p.PortName -KeepPort $keepPort -DriverName $p.DriverName -DestinationFile (Join-Path $filesDir 'printer.printerExport')
-
-        Set-Step 'Capturing printer preferences (PrintUI)...' 50
-        $useSettingsDat = Export-PrinterSettingsDat -PrinterName $p.Name -DestinationFile (Join-Path $filesDir 'printer_settings.dat')
-
-        Set-Step 'Reading print configuration...' 55
-        $cfg = Invoke-WithTimeout -Script 'param($Name) Get-PrintConfiguration -PrinterName $Name -ErrorAction Stop' -Parameters @{ Name = $p.Name } -TimeoutSeconds 20
-        $cfg = @($cfg) | Select-Object -First 1
-        if ($cfg)
-        {
-            $duplex = "$($cfg.DuplexingMode)"
-            $paper = "$($cfg.PaperSize)"
-            if ($null -ne $cfg.Color) { $color = [bool]$cfg.Color }
-        }
-        else { Write-Log 'Print configuration could not be read (printer offline?); skipped.' 'WARN' }
+        if ($tempCapture) { Remove-Item -LiteralPath $tempCapture -Recurse -Force -ErrorAction SilentlyContinue }
     }
+    $driverFolder = "$($cap.DriverFolder)"
+    $driverInf = "$($cap.DriverInf)"
+    $builtInDriver = [bool]$cap.BuiltInDriver
+    $usePrintBrm = [bool]$cap.UsePrintBrm -and (Test-Path -LiteralPath (Join-Path $filesDir 'printer.printerExport'))
+    $useSettingsDat = [bool]$cap.UseSettingsDat -and (Test-Path -LiteralPath (Join-Path $filesDir 'printer_settings.dat'))
+    $duplex = "$($cap.DuplexingMode)"
+    $paper = "$($cap.PaperSize)"
+    $color = $cap.Color
+    if ($adv.Duplex) { $duplex = "$($adv.Duplex)" }
+    if ($adv.PaperSize) { $paper = "$($adv.PaperSize)" }
+    if ($adv.Color -eq 'Color') { $color = $true } elseif ($adv.Color -eq 'Mono') { $color = $false }
 
     Set-Step 'Writing deployment script...' 60
     $config = [ordered]@{
@@ -1038,20 +1268,20 @@ function New-PrinterPackage
         AppVendor          = $appVendor
         AppVersion         = $appVersion
         PrinterName        = $targetName
-        SourcePrinterName  = $p.Name
+        SourcePrinterName  = if ($p.SourceName) { $p.SourceName } else { $p.Name }
         DriverName         = $p.DriverName
         DriverFolder       = $driverFolder
         DriverInf          = "$driverInf"
         PortName           = $portName
         PrinterHostAddress = $hostAddress
-        Protocol           = if ($keepPort) { $p.Protocol } else { 1 }
-        PortNumber         = if ($keepPort) { $p.PortNumber } else { 9100 }
-        LprQueueName       = if ($keepPort) { $p.LprQueueName } else { '' }
-        SnmpEnabled        = if ($keepPort) { $p.SnmpEnabled } else { $false }
-        SnmpCommunity      = $p.SnmpCommunity
-        SnmpIndex          = $p.SnmpIndex
-        Comment            = $p.Comment
-        Location           = $p.Location
+        Protocol           = $protocol
+        PortNumber         = $portNumber
+        LprQueueName       = $lprQueue
+        SnmpEnabled        = $snmpEnabled
+        SnmpCommunity      = $snmpCommunity
+        SnmpIndex          = if ($p.SnmpIndex) { [int]$p.SnmpIndex } else { 1 }
+        Comment            = $comment
+        Location           = $location
         IsDefault          = [bool]$Request.SetDefault
         UsePrintBrm        = $usePrintBrm
         UseSettingsDat     = $useSettingsDat
@@ -1628,6 +1858,78 @@ function Save-Printers
 }
 #endregion
 
+#region App update (GitHub releases)
+function ConvertTo-ToolVersion
+{
+    param ([string]$Text)
+    $v = $null
+    if ([version]::TryParse(($Text -replace '^v', '' -replace '[-+].*$', ''), [ref]$v)) { return $v }
+    return $null
+}
+
+function Get-LatestRelease
+{
+    # Newest non-pre-release on GitHub, compared with the running version.
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$($Ctx.UpdateRepo)/releases/latest" -Headers @{ 'User-Agent' = 'IntunePrinterPackager' } -TimeoutSec 15
+    $asset = @($release.assets) | Where-Object { $_.name -eq 'PrinterPackager.exe' } | Select-Object -First 1
+    $latest = ConvertTo-ToolVersion $release.tag_name
+    $current = ConvertTo-ToolVersion $Ctx.ToolVersion
+    # Builds with a suffix (2.2.0-ci.5, 2.2.0-beta.1) count as older than the same final version.
+    $isPreview = "$($Ctx.ToolVersion)" -match '-'
+    $newer = $latest -and $asset -and (-not $current -or $latest -gt $current -or ($latest -eq $current -and $isPreview))
+    return [pscustomobject]@{
+        __Result = $true
+        Tag      = "$($release.tag_name)"
+        Url      = if ($asset) { "$($asset.browser_download_url)" } else { '' }
+        Newer    = [bool]$newer
+        Current  = "$($Ctx.ToolVersion)"
+    }
+}
+
+function Install-AppUpdate
+{
+    # Downloads the new exe and swaps it in next to the running one (a running exe can be renamed, not overwritten).
+    # When that folder isn't writable (e.g. a read-only share) the new exe goes to Downloads instead.
+    param ([string]$Url, [string]$Tag)
+    $ErrorActionPreference = 'Stop'
+    if (-not $Ctx.LauncherPath) { throw 'Updating only works when started from PrinterPackager.exe.' }
+    $exe = $Ctx.LauncherPath
+    $dir = Split-Path -Parent $exe
+    $tmp = Join-Path ([IO.Path]::GetTempPath()) ("PrinterPackager-$Tag.exe")
+    Set-Step "Downloading $Tag..."
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    $wc = New-Object Net.WebClient
+    $wc.Headers['User-Agent'] = 'IntunePrinterPackager'
+    $wc.Proxy = [Net.WebRequest]::GetSystemWebProxy()
+    $wc.Proxy.Credentials = [Net.CredentialCache]::DefaultNetworkCredentials
+    try { $wc.DownloadFile($Url, $tmp) } finally { $wc.Dispose() }
+    if ((Get-Item -LiteralPath $tmp).Length -lt 1MB) { throw 'The download is incomplete.' }
+
+    Set-Step 'Installing the update...'
+    $old = "$exe.old"
+    try
+    {
+        if (Test-Path -LiteralPath $old) { Remove-Item -LiteralPath $old -Force }
+        Rename-Item -LiteralPath $exe -NewName (Split-Path -Leaf $old)
+        try { Copy-Item -LiteralPath $tmp -Destination $exe -Force }
+        catch { Rename-Item -LiteralPath $old -NewName (Split-Path -Leaf $exe); throw }
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+        Write-Log "Updated to $Tag." 'OK'
+        return [pscustomobject]@{ __Result = $true; Restart = $exe; SavedTo = '' }
+    }
+    catch
+    {
+        $downloads = Join-Path ([Environment]::GetFolderPath('UserProfile')) 'Downloads'
+        New-Item -Path $downloads -ItemType Directory -Force | Out-Null
+        $saved = Join-Path $downloads 'PrinterPackager.exe'
+        Move-Item -LiteralPath $tmp -Destination $saved -Force
+        Write-Log "Could not replace $exe ($($_.Exception.Message)). The new version was saved to $saved." 'WARN'
+        return [pscustomobject]@{ __Result = $true; Restart = ''; SavedTo = $saved }
+    }
+}
+#endregion
+
 }
 . $WorkerCode
 $WorkerCodeText = $WorkerCode.ToString()
@@ -1637,14 +1939,22 @@ $WorkerCodeText = $WorkerCode.ToString()
 if ($IsHeadless)
 {
     $ErrorActionPreference = 'Stop'
-    $inventory = Get-PrinterInventory
-    $printer = $inventory.Printers | Where-Object { $_.Name -eq $PrinterName } | Select-Object -First 1
-    if (-not $printer) { throw "Printer '$PrinterName' was not found. Available: $(($inventory.Printers | ForEach-Object Name) -join ', ')" }
+    if ($FromLibrary)
+    {
+        $printer = (Get-PrinterLibrary -LibraryDir $LibraryDir).Printers | Where-Object { $_.Name -eq $PrinterName } | Select-Object -First 1
+        if (-not $printer) { throw "Printer '$PrinterName' is not in the library $LibraryDir." }
+    }
+    else
+    {
+        $inventory = Get-PrinterInventory
+        $printer = $inventory.Printers | Where-Object { $_.Name -eq $PrinterName } | Select-Object -First 1
+        if (-not $printer) { throw "Printer '$PrinterName' was not found. Available: $(($inventory.Printers | ForEach-Object Name) -join ', ')" }
+    }
     if (-not $OutputDir) { $OutputDir = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'Printer Packages' }
-    $result = New-PrinterPackage -Request @{
+    $request = @{
         Printer            = $printer
         TargetName         = $printer.Name
-        HostAddress        = if ($PrinterHostAddress) { $PrinterHostAddress } else { $printer.HostAddress }
+        HostAddress        = if ($PrinterHostAddress) { $PrinterHostAddress } else { $printer.Address }
         AppVendor          = if ($AppVendor) { $AppVendor } else { 'Company' }
         AppName            = "Printer - $($printer.Name)"
         AppVersion         = $AppVersion
@@ -1655,7 +1965,20 @@ if ($IsHeadless)
         CreateIntuneWin    = -not $NoIntuneWin
         CreateZip          = [bool]$Zip
         OutputDir          = $OutputDir
+        CaptureDir         = $printer.CaptureDir
+        Advanced           = @{}
     }
+    if ($printer.SavedSettings -and $printer.SavedSettings.Advanced)
+    {
+        foreach ($prop in $printer.SavedSettings.Advanced.PSObject.Properties) { $request.Advanced[$prop.Name] = $prop.Value }
+    }
+    if ($SaveToLibrary)
+    {
+        $result = Save-PrinterToLibrary -Requests @($request) -LibraryDir $LibraryDir
+        $failed = @($result.Results | Where-Object Status -eq 'Failed')
+        if ($failed) { throw $failed[0].Error }
+    }
+    else { $result = New-PrinterPackage -Request $request }
     $result | Select-Object -Property * -ExcludeProperty __Result | Format-List | Out-String | Write-Host
     return
 }
@@ -1770,6 +2093,28 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, Sys
                 </Setter.Value>
             </Setter>
         </Style>
+        <Style x:Key="SegmentButton" TargetType="RadioButton">
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="RadioButton">
+                        <Border x:Name="Bd" Background="White" BorderBrush="#D1D1D1" BorderThickness="1" CornerRadius="14" Padding="14,4">
+                            <ContentPresenter x:Name="Cp" HorizontalAlignment="Center" VerticalAlignment="Center" TextElement.Foreground="#1B1B1B"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsChecked" Value="True">
+                                <Setter TargetName="Bd" Property="Background" Value="#C80032"/>
+                                <Setter TargetName="Bd" Property="BorderBrush" Value="#C80032"/>
+                                <Setter TargetName="Cp" Property="TextElement.Foreground" Value="White"/>
+                            </Trigger>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Bd" Property="BorderBrush" Value="#C80032"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
         <Style TargetType="CheckBox">
             <Setter Property="Margin" Value="0,0,0,10"/>
             <Setter Property="VerticalContentAlignment" Value="Center"/>
@@ -1834,6 +2179,12 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, Sys
                         <TextBlock Name="TxtAccountUser" FontWeight="SemiBold" HorizontalAlignment="Right"/>
                         <TextBlock Name="TxtAccountTenant" Foreground="{StaticResource Muted}" FontSize="12" HorizontalAlignment="Right"/>
                     </StackPanel>
+                    <Button Name="BtnUpdate" Margin="0,0,10,0" ToolTip="Check for a new version">
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="&#xE896;" FontFamily="Segoe MDL2 Assets" Margin="0,1,8,0" VerticalAlignment="Center"/>
+                            <TextBlock Name="TxtUpdate" Text="Update"/>
+                        </StackPanel>
+                    </Button>
                     <Button Name="BtnSignIn" Margin="0,0,10,0">
                         <StackPanel Orientation="Horizontal">
                             <TextBlock Text="&#xE77B;" FontFamily="Segoe MDL2 Assets" Margin="0,1,8,0" VerticalAlignment="Center"/>
@@ -1871,9 +2222,21 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, Sys
                             <ColumnDefinition Width="240"/>
                         </Grid.ColumnDefinitions>
                         <StackPanel VerticalAlignment="Center">
+                            <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                                <RadioButton Name="RbSourcePc" Content="This PC" GroupName="Source" IsChecked="True" Style="{StaticResource SegmentButton}"/>
+                                <RadioButton Name="RbSourceLibrary" Content="Library" GroupName="Source" Style="{StaticResource SegmentButton}" Margin="6,0,0,0"/>
+                            </StackPanel>
                             <TextBlock Text="1. Choose a printer" FontSize="14" FontWeight="SemiBold"/>
                             <TextBlock Name="TxtCount" Text="Loading..." Foreground="{StaticResource Muted}" FontSize="12"/>
-                            <TextBlock Text="Tick one or more printers." Foreground="{StaticResource Muted}" FontSize="12"/>
+                            <StackPanel Orientation="Horizontal">
+                                <TextBlock Text="Tick one or more printers." Foreground="{StaticResource Muted}" FontSize="12"/>
+                                <Button Name="BtnSelectAll" Content="Select all" Style="{StaticResource LinkButton}" FontSize="12" Margin="8,0,0,0"/>
+                            </StackPanel>
+                            <StackPanel Name="PanelLibraryPath" Orientation="Horizontal" Visibility="Collapsed" Margin="0,4,0,0">
+                                <TextBlock Text="Library:" Foreground="{StaticResource Muted}" FontSize="12"/>
+                                <TextBlock Name="TxtLibraryPath" FontSize="12" Margin="4,0,0,0" MaxWidth="320" TextTrimming="CharacterEllipsis"/>
+                                <Button Name="BtnLibraryBrowse" Content="Change..." Style="{StaticResource LinkButton}" FontSize="12" Margin="8,0,0,0"/>
+                            </StackPanel>
                         </StackPanel>
                         <Grid Grid.Column="1">
                             <TextBox Name="TxtFilter" Padding="30,6,8,6"/>
@@ -1968,6 +2331,10 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, Sys
                             <TextBlock Text="IP address or hostname" Style="{StaticResource Label}"/>
                             <TextBox Name="TxtHost"/>
                             <TextBlock Name="TxtHostHint" Foreground="#B54700" FontSize="12" TextWrapping="Wrap" Margin="0,4,0,0" Visibility="Collapsed"/>
+                            <StackPanel Orientation="Horizontal" Margin="0,10,0,0">
+                                <Button Name="BtnAdvanced" Content="Advanced settings..." Style="{StaticResource LinkButton}"/>
+                                <TextBlock Name="TxtAdvancedSummary" Foreground="{StaticResource Muted}" FontSize="12" Margin="10,0,0,0" TextTrimming="CharacterEllipsis" MaxWidth="220"/>
+                            </StackPanel>
                             </StackPanel>
 
                             <Border BorderBrush="{StaticResource Line}" BorderThickness="0,1,0,0" Margin="0,16,0,14"/>
@@ -2017,6 +2384,7 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, Sys
                     <ColumnDefinition Width="*"/>
                     <ColumnDefinition Width="Auto"/>
                     <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/>
                 </Grid.ColumnDefinitions>
                 <TextBlock Text="Save to" VerticalAlignment="Center" FontWeight="SemiBold" Margin="0,0,12,0"/>
                 <Grid Grid.Column="1">
@@ -2029,8 +2397,9 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, Sys
                     <Button Name="BtnBrowseOutput" Grid.Column="1" Content="Browse..." Margin="8,0,0,0"/>
                     <Button Name="BtnOpenOutput" Grid.Column="2" Content="Open" Margin="8,0,0,0"/>
                 </Grid>
-                <Button Name="BtnPackageLocal" Grid.Column="2" Content="Save files only" Margin="24,0,10,0" Padding="16,9"/>
-                <Button Name="BtnPackage" Grid.Column="3" Style="{StaticResource AccentButton}" Content="Publish to Company Portal"/>
+                <Button Name="BtnSaveLibrary" Grid.Column="2" Content="Save to library" Margin="24,0,10,0" Padding="16,9"/>
+                <Button Name="BtnPackageLocal" Grid.Column="3" Content="Save files only" Margin="0,0,10,0" Padding="16,9"/>
+                <Button Name="BtnPackage" Grid.Column="4" Style="{StaticResource AccentButton}" Content="Publish to Company Portal"/>
             </Grid>
         </Border>
 
@@ -2181,6 +2550,7 @@ function New-Bitmap
 
 $ui.ImgBrand.Source = New-Bitmap (Join-Path $Ctx.BrandingDir 'connectify-logo.png')
 $window.Icon = New-Bitmap (Join-Path $Ctx.BrandingDir 'connectify-icon.png')
+if ($ToolVersion) { $window.Title = "Printer Packager $ToolVersion" }
 #endregion
 
 #region Settings
@@ -2191,6 +2561,7 @@ $Settings = [pscustomobject]@{
     IncludeDriver      = $true
     IncludePreferences = $true
     CreateZip          = $false
+    LibraryDir         = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'Printer Library'
 }
 try
 {
@@ -2203,12 +2574,14 @@ try
 catch { }
 if ($OutputDir) { $Settings.OutputDir = $OutputDir }
 if ($AppVendor) { $Settings.Vendor = $AppVendor }
+if ($LibraryDir) { $Settings.LibraryDir = $LibraryDir }
 
 $ui.TxtVendor.Text = $Settings.Vendor
 $ui.TxtOutput.Text = $Settings.OutputDir
 $ui.ChkDriver.IsChecked = [bool]$Settings.IncludeDriver
 $ui.ChkPrefs.IsChecked = [bool]$Settings.IncludePreferences
 $ui.ChkZip.IsChecked = [bool]$Settings.CreateZip
+$ui.TxtLibraryPath.Text = $Settings.LibraryDir
 
 function Save-Settings
 {
@@ -2219,6 +2592,7 @@ function Save-Settings
         $Settings.IncludeDriver = [bool]$ui.ChkDriver.IsChecked
         $Settings.IncludePreferences = [bool]$ui.ChkPrefs.IsChecked
         $Settings.CreateZip = [bool]$ui.ChkZip.IsChecked
+        $Settings.LibraryDir = $ui.TxtLibraryPath.Text.Trim()
         New-Item -Path (Split-Path -Parent $SettingsFile) -ItemType Directory -Force | Out-Null
         [IO.File]::WriteAllText($SettingsFile, ($Settings | ConvertTo-Json))
     }
@@ -2312,6 +2686,7 @@ $timer.Add_Tick({
             $ui.TxtLog.AppendText($sb.ToString())
             $ui.TxtLog.ScrollToEnd()
         }
+        if ($script:UpdateCheck -and $script:UpdateCheck.Handle.IsCompleted) { Complete-UpdateCheck }
         if ($script:Job)
         {
             $ui.TxtBusyStep.Text = $Sync.Step
@@ -2339,6 +2714,7 @@ $Overrides = @{}
 $CurrentPrinter = $null
 $Loading = $false
 $Auth = $null
+$Source = 'pc'
 
 function Update-PrinterList
 {
@@ -2359,14 +2735,28 @@ function Update-PrinterList
         return ("$($item.Name) $($item.DriverName) $($item.Address) $($item.Location) $($item.Brand)" -like "*$f*")
     }
     $ui.GridPrinters.ItemsSource = $view
-    $ui.TxtCount.Text = if ($script:AllPrinters.Count -eq 1) { '1 printer on this computer' } else { "$($script:AllPrinters.Count) printers on this computer" }
+    $where = if ($script:Source -eq 'library') { 'in the library' } else { 'on this computer' }
+    $ui.TxtCount.Text = if ($script:AllPrinters.Count -eq 1) { "1 printer $where" } else { "$($script:AllPrinters.Count) printers $where" }
+    $ui.TxtEmpty.Text = if ($script:Source -eq 'library') { 'The library is empty. Save printers to it from This PC.' } else { 'No printers found on this computer.' }
     $ui.TxtEmpty.Visibility = if ($script:AllPrinters.Count) { 'Collapsed' } else { 'Visible' }
 }
 
 function Start-PrinterScan
 {
     $script:ReselectNames = @($ui.GridPrinters.SelectedItems | ForEach-Object { $_.Name })
-    Start-Work -Title 'Loading printers...' -Command 'Get-PrinterInventory' -OnDone {
+    if ($script:Source -eq 'library')
+    {
+        $command = 'Get-PrinterLibrary'
+        $arguments = @{ LibraryDir = $ui.TxtLibraryPath.Text.Trim() }
+        $title = 'Loading the printer library...'
+    }
+    else
+    {
+        $command = 'Get-PrinterInventory'
+        $arguments = @{}
+        $title = 'Loading printers...'
+    }
+    Start-Work -Title $title -Command $command -Arguments $arguments -OnDone {
         param ($result, $failure)
         if ($failure) { Show-Error $failure 'Could not read the printers'; return }
         Update-PrinterList $result.Printers
@@ -2379,16 +2769,30 @@ function Start-PrinterScan
 function Get-PrinterSettings
 {
     param ($Printer)
-    if (-not $Overrides.ContainsKey($Printer.Name))
+    $key = "$($Printer.Key)"
+    if (-not $Overrides.ContainsKey($key))
     {
-        $Overrides[$Printer.Name] = @{
+        $o = @{
             TargetName  = $Printer.Name
             HostAddress = $Printer.HostAddress
             AppName     = "Printer - $($Printer.Name)"
             LogoPath    = $Printer.LogoPath
+            Advanced    = @{}
         }
+        # Library entries start from what was saved with them.
+        $saved = $Printer.SavedSettings
+        if ($saved)
+        {
+            if ($saved.HostAddress) { $o.HostAddress = "$($saved.HostAddress)" }
+            if ($saved.AppName) { $o.AppName = "$($saved.AppName)" }
+            if ($saved.Advanced)
+            {
+                foreach ($prop in $saved.Advanced.PSObject.Properties) { $o.Advanced[$prop.Name] = $prop.Value }
+            }
+        }
+        $Overrides[$key] = $o
     }
-    return $Overrides[$Printer.Name]
+    return $Overrides[$key]
 }
 
 function Save-CurrentPrinterSettings
@@ -2464,6 +2868,7 @@ function Update-SelectedPrinter
             $ui.TxtHostHint.Text = "This printer uses a $($p.PortKind) port. Enter its IP address or hostname so other devices can reach it."
             $ui.TxtHostHint.Visibility = 'Visible'
         }
+        Update-AdvancedSummary $o
     }
     finally { $script:Loading = $false }
     $script:CurrentPrinter = $p
@@ -2614,11 +3019,27 @@ $ui.BtnResultClose.Add_Click({ $ui.ResultCard.Visibility = 'Collapsed'; $ui.Over
 
 function Show-ResultList
 {
-    param ([object[]]$Results, [bool]$Published)
+    param ([object[]]$Results, [string]$Mode)
     $ok = @($Results | Where-Object { $_.Status -ne 'Failed' }).Count
     $failed = $Results.Count - $ok
-    $ui.TxtResultListTitle.Text = if ($Published) { "Published $ok of $($Results.Count) printer(s)" } else { "Saved $ok of $($Results.Count) printer(s)" }
-    $ui.TxtResultListSub.Text = if ($Published) { 'Users find them in Company Portal (available for all users). It can take a few minutes before they show up.' } else { "Files are in $($ui.TxtOutput.Text)." }
+    switch ($Mode)
+    {
+        'Published'
+        {
+            $ui.TxtResultListTitle.Text = "Published $ok of $($Results.Count) printer(s)"
+            $ui.TxtResultListSub.Text = 'Users find them in Company Portal (available for all users). It can take a few minutes before they show up.'
+        }
+        'Library'
+        {
+            $ui.TxtResultListTitle.Text = "Saved $ok of $($Results.Count) printer(s) to the library"
+            $ui.TxtResultListSub.Text = "Library: $($ui.TxtLibraryPath.Text). Open it on any PC under Library."
+        }
+        default
+        {
+            $ui.TxtResultListTitle.Text = "Saved $ok of $($Results.Count) printer(s)"
+            $ui.TxtResultListSub.Text = "Files are in $($ui.TxtOutput.Text)."
+        }
+    }
     if ($failed) { $ui.TxtResultListSub.Text += " $failed failed, see below." }
     $ui.ListResults.ItemsSource = @(foreach ($r in $Results)
     {
@@ -2627,6 +3048,7 @@ function Show-ResultList
             'Failed' { $r.Error }
             'Created' { "New app, version $($r.Version)" }
             'Updated' { "Existing app updated to version $($r.Version)" }
+            'Library' { 'Saved to the library' }
             'SavedNoIntuneWin' { "Saved without .intunewin (IntuneWinAppUtil.exe not available offline), version $($r.Version)" }
             default { "Saved, version $($r.Version)" }
         }
@@ -2676,6 +3098,8 @@ function Get-PackageRequests
             AppName            = $o.AppName
             AppVersion         = $ui.TxtVersion.Text
             LogoPath           = $o.LogoPath
+            Advanced           = $o.Advanced
+            CaptureDir         = $p.CaptureDir
             IncludeDriver      = [bool]$ui.ChkDriver.IsChecked
             IncludePreferences = [bool]$ui.ChkPrefs.IsChecked
             SetDefault         = [bool]$ui.ChkDefault.IsChecked
@@ -2704,7 +3128,7 @@ function Start-SaveFiles
     Start-Work -Title "Packaging $($requests.Count) printers..." -Command 'Save-Printers' -Arguments @{ Requests = $requests } -OnDone {
         param ($result, $failure)
         if ($failure) { Show-Error $failure 'Packaging failed'; return }
-        Show-ResultList $result.Results $false
+        Show-ResultList $result.Results 'Saved'
     }
 }
 
@@ -2718,21 +3142,371 @@ function Start-Publish
     Start-Work -Title $title -Command 'Publish-Printers' -Arguments @{ Auth = $script:Auth; Requests = $requests } -OnDone {
         param ($result, $failure)
         if ($failure) { Show-Error $failure 'Publishing failed'; return }
-        Show-ResultList $result.Results $true
+        Show-ResultList $result.Results 'Published'
     }
 }
 $ui.BtnPackage.Add_Click({ try { Start-Publish } catch { Show-Error $_ } })
 $ui.BtnPackageLocal.Add_Click({ try { Start-SaveFiles } catch { Show-Error $_ } })
 #endregion
 
+#region Advanced settings
+function Update-AdvancedSummary
+{
+    param ($Settings)
+    $a = $Settings.Advanced
+    $parts = @()
+    if ($a.Duplex) { $parts += @{ OneSided = 'one-sided'; TwoSidedLongEdge = 'duplex long edge'; TwoSidedShortEdge = 'duplex short edge' }[$a.Duplex] }
+    if ($a.Color) { $parts += @{ Color = 'colour'; Mono = 'black and white' }[$a.Color] }
+    if ($a.PaperSize) { $parts += $a.PaperSize }
+    if ($a.Protocol -or $a.PortNumber -or $a.LprQueueName -or $null -ne $a.SnmpEnabled) { $parts += 'port changed' }
+    if ($null -ne $a.Location -or $null -ne $a.Comment) { $parts += 'location/comment' }
+    $ui.TxtAdvancedSummary.Text = if ($parts) { 'Changed: ' + ($parts -join ', ') } else { '' }
+}
+
+function Show-AdvancedDialog
+{
+    param ($Printer, $Settings, [string]$SnapPath)
+    [xml]$advXaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Advanced settings" Width="520" SizeToContent="Height" ResizeMode="NoResize"
+        WindowStartupLocation="CenterOwner" Background="White" Foreground="#1B1B1B"
+        FontFamily="Segoe UI Variable Text, Segoe UI" FontSize="13" UseLayoutRounding="True">
+    <Window.Resources>
+        <Style TargetType="TextBlock" x:Key="Label">
+            <Setter Property="Foreground" Value="#616161"/>
+            <Setter Property="FontSize" Value="12"/>
+            <Setter Property="Margin" Value="0,0,0,4"/>
+        </Style>
+        <Style TargetType="TextBox">
+            <Setter Property="Padding" Value="6,5"/>
+            <Setter Property="BorderBrush" Value="#D1D1D1"/>
+        </Style>
+        <Style TargetType="ComboBox">
+            <Setter Property="Padding" Value="6,5"/>
+        </Style>
+        <Style TargetType="Button">
+            <Setter Property="Padding" Value="16,7"/>
+            <Setter Property="Background" Value="White"/>
+            <Setter Property="BorderBrush" Value="#D1D1D1"/>
+        </Style>
+    </Window.Resources>
+    <StackPanel Margin="22,18,22,18">
+        <TextBlock Name="TxtTitle" FontSize="16" FontWeight="SemiBold"/>
+        <TextBlock Text="These settings are used on the devices. Leave on 'Keep' to use what was captured." Foreground="#616161" TextWrapping="Wrap" Margin="0,4,0,16"/>
+
+        <TextBlock Text="Location" Style="{StaticResource Label}"/>
+        <TextBox Name="TxtLocation" Margin="0,0,0,10"/>
+        <TextBlock Text="Comment" Style="{StaticResource Label}"/>
+        <TextBox Name="TxtComment" Margin="0,0,0,16"/>
+
+        <TextBlock Text="Print defaults" FontWeight="SemiBold" Margin="0,0,0,8"/>
+        <Grid Margin="0,0,0,16">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="10"/>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="10"/>
+                <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+            <StackPanel>
+                <TextBlock Text="Duplex" Style="{StaticResource Label}"/>
+                <ComboBox Name="CmbDuplex">
+                    <ComboBoxItem Content="Keep" Tag="" IsSelected="True"/>
+                    <ComboBoxItem Content="One-sided" Tag="OneSided"/>
+                    <ComboBoxItem Content="Long edge" Tag="TwoSidedLongEdge"/>
+                    <ComboBoxItem Content="Short edge" Tag="TwoSidedShortEdge"/>
+                </ComboBox>
+            </StackPanel>
+            <StackPanel Grid.Column="2">
+                <TextBlock Text="Colour" Style="{StaticResource Label}"/>
+                <ComboBox Name="CmbColor">
+                    <ComboBoxItem Content="Keep" Tag="" IsSelected="True"/>
+                    <ComboBoxItem Content="Colour" Tag="Color"/>
+                    <ComboBoxItem Content="Black and white" Tag="Mono"/>
+                </ComboBox>
+            </StackPanel>
+            <StackPanel Grid.Column="4">
+                <TextBlock Text="Paper size" Style="{StaticResource Label}"/>
+                <ComboBox Name="CmbPaper">
+                    <ComboBoxItem Content="Keep" Tag="" IsSelected="True"/>
+                    <ComboBoxItem Content="A4" Tag="A4"/>
+                    <ComboBoxItem Content="A3" Tag="A3"/>
+                    <ComboBoxItem Content="A5" Tag="A5"/>
+                    <ComboBoxItem Content="Letter" Tag="Letter"/>
+                    <ComboBoxItem Content="Legal" Tag="Legal"/>
+                </ComboBox>
+            </StackPanel>
+        </Grid>
+
+        <TextBlock Text="Port" FontWeight="SemiBold" Margin="0,0,0,8"/>
+        <Grid Margin="0,0,0,10">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="10"/>
+                <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+            <StackPanel>
+                <TextBlock Text="Protocol" Style="{StaticResource Label}"/>
+                <ComboBox Name="CmbProtocol">
+                    <ComboBoxItem Content="RAW" Tag="1"/>
+                    <ComboBoxItem Content="LPR" Tag="2"/>
+                </ComboBox>
+            </StackPanel>
+            <StackPanel Grid.Column="2">
+                <TextBlock Name="LblPortValue" Text="Port number" Style="{StaticResource Label}"/>
+                <TextBox Name="TxtPortValue"/>
+            </StackPanel>
+        </Grid>
+        <StackPanel Orientation="Horizontal" Margin="0,0,0,16">
+            <CheckBox Name="ChkSnmp" Content="SNMP status" VerticalAlignment="Center"/>
+            <TextBlock Text="Community" Foreground="#616161" Margin="16,0,6,0" VerticalAlignment="Center"/>
+            <TextBox Name="TxtCommunity" Width="120"/>
+        </StackPanel>
+
+        <Border Name="PanelVendor" Background="#F7F7F7" CornerRadius="6" Padding="12" Margin="0,0,0,16">
+            <StackPanel>
+                <TextBlock Text="Trays, finishing and other driver settings" FontWeight="SemiBold"/>
+                <TextBlock Text="Open the printer's own settings, change them under Advanced &gt; Printing Defaults, click OK. They are captured when you package or save to the library." TextWrapping="Wrap" Foreground="#616161" Margin="0,4,0,8"/>
+                <Button Name="BtnVendor" Content="Open printer settings..." HorizontalAlignment="Left"/>
+            </StackPanel>
+        </Border>
+
+        <Grid>
+            <Button Name="BtnReset" Content="Reset" HorizontalAlignment="Left"/>
+            <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                <Button Name="BtnCancel" Content="Cancel" Margin="0,0,10,0" IsCancel="True"/>
+                <Button Name="BtnOk" Content="OK" IsDefault="True" Background="#C80032" Foreground="White" BorderBrush="#C80032"/>
+            </StackPanel>
+        </Grid>
+    </StackPanel>
+</Window>
+'@
+    $dlg = [Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $advXaml))
+    $dlg.Owner = $window
+    $d = @{}
+    foreach ($node in $advXaml.SelectNodes('//*[@Name]')) { $d[$node.Name] = $dlg.FindName($node.Name) }
+    $a = $Settings.Advanced
+
+    function Select-Tag ($Combo, [string]$Tag)
+    {
+        foreach ($item in $Combo.Items) { if ("$($item.Tag)" -eq $Tag) { $Combo.SelectedItem = $item; return } }
+    }
+    $fill = {
+        param ($adv)
+        $d.TxtTitle.Text = "Advanced settings - $($Settings.TargetName)"
+        $d.TxtLocation.Text = if ($null -ne $adv.Location) { $adv.Location } else { $Printer.Location }
+        $d.TxtComment.Text = if ($null -ne $adv.Comment) { $adv.Comment } else { $Printer.Comment }
+        Select-Tag $d.CmbDuplex "$($adv.Duplex)"
+        Select-Tag $d.CmbColor "$($adv.Color)"
+        Select-Tag $d.CmbPaper "$($adv.PaperSize)"
+        $proto = if ($adv.Protocol) { [int]$adv.Protocol } elseif ($Printer.PortKind -eq 'TCP/IP' -and $Printer.Protocol) { [int]$Printer.Protocol } else { 1 }
+        Select-Tag $d.CmbProtocol "$proto"
+        $script:AdvPortNumber = if ($adv.PortNumber) { "$($adv.PortNumber)" } elseif ($Printer.PortNumber) { "$($Printer.PortNumber)" } else { '9100' }
+        $script:AdvLprQueue = if ($adv.LprQueueName) { "$($adv.LprQueueName)" } elseif ($Printer.LprQueueName) { "$($Printer.LprQueueName)" } else { 'lp' }
+        $d.TxtPortValue.Text = if ($proto -eq 2) { $script:AdvLprQueue } else { $script:AdvPortNumber }
+        $d.LblPortValue.Text = if ($proto -eq 2) { 'Queue name' } else { 'Port number' }
+        $d.ChkSnmp.IsChecked = if ($null -ne $adv.SnmpEnabled) { [bool]$adv.SnmpEnabled } else { [bool]$Printer.SnmpEnabled }
+        $d.TxtCommunity.Text = if ($adv.SnmpCommunity) { $adv.SnmpCommunity } elseif ($Printer.SnmpCommunity) { $Printer.SnmpCommunity } else { 'public' }
+    }
+    & $fill $a
+
+    $d.CmbProtocol.Add_SelectionChanged({
+        $isLpr = "$($d.CmbProtocol.SelectedItem.Tag)" -eq '2'
+        if ($isLpr) { $script:AdvPortNumber = $d.TxtPortValue.Text; $d.TxtPortValue.Text = $script:AdvLprQueue; $d.LblPortValue.Text = 'Queue name' }
+        else { $script:AdvLprQueue = $d.TxtPortValue.Text; $d.TxtPortValue.Text = $script:AdvPortNumber; $d.LblPortValue.Text = 'Port number' }
+    })
+    if ($Printer.CaptureDir)
+    {
+        $d.PanelVendor.Visibility = 'Collapsed'
+    }
+    else
+    {
+        $d.BtnVendor.Add_Click({
+            try { Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\rundll32.exe') -ArgumentList "printui.dll,PrintUIEntry /p /n `"$($Printer.Name)`"" }
+            catch { Show-Error $_ }
+        })
+    }
+    $d.BtnReset.Add_Click({ & $fill @{} })
+    $d.BtnOk.Add_Click({
+        $isLpr = "$($d.CmbProtocol.SelectedItem.Tag)" -eq '2'
+        $value = $d.TxtPortValue.Text.Trim()
+        $num = 0
+        if (-not $isLpr -and (-not [int]::TryParse($value, [ref]$num) -or $num -lt 1 -or $num -gt 65535))
+        {
+            [void][Windows.MessageBox]::Show($dlg, 'The port number must be between 1 and 65535.', 'Advanced settings', 'OK', 'Warning')
+            return
+        }
+        $new = @{}
+        if ($d.TxtLocation.Text -ne "$($Printer.Location)") { $new.Location = $d.TxtLocation.Text }
+        if ($d.TxtComment.Text -ne "$($Printer.Comment)") { $new.Comment = $d.TxtComment.Text }
+        foreach ($pair in @(@('Duplex', $d.CmbDuplex), @('Color', $d.CmbColor), @('PaperSize', $d.CmbPaper)))
+        {
+            $tag = "$($pair[1].SelectedItem.Tag)"
+            if ($tag) { $new[$pair[0]] = $tag }
+        }
+        $origProto = if ($Printer.PortKind -eq 'TCP/IP' -and $Printer.Protocol) { [int]$Printer.Protocol } else { 1 }
+        $proto = [int]"$($d.CmbProtocol.SelectedItem.Tag)"
+        if ($proto -ne $origProto) { $new.Protocol = $proto }
+        if ($isLpr) { if ($value -and $value -ne "$($Printer.LprQueueName)") { $new.LprQueueName = $value } }
+        elseif ($num -ne [int]$Printer.PortNumber -and -not ($num -eq 9100 -and -not $Printer.PortNumber)) { $new.PortNumber = $num }
+        if ([bool]$d.ChkSnmp.IsChecked -ne [bool]$Printer.SnmpEnabled) { $new.SnmpEnabled = [bool]$d.ChkSnmp.IsChecked }
+        if ([bool]$d.ChkSnmp.IsChecked -and $d.TxtCommunity.Text.Trim() -and $d.TxtCommunity.Text.Trim() -ne "$($Printer.SnmpCommunity)") { $new.SnmpCommunity = $d.TxtCommunity.Text.Trim() }
+        $Settings.Advanced = $new
+        $dlg.DialogResult = $true
+    })
+    if ($SnapPath)
+    {
+        # Self-test: render the dialog once, save it, close it.
+        $dlg.Add_ContentRendered({ try { Save-WindowImage -Path $SnapPath -Target $dlg } finally { $dlg.Close() } })
+    }
+    [void]$dlg.ShowDialog()
+    Update-AdvancedSummary $Settings
+}
+
+$ui.BtnAdvanced.Add_Click({
+    try
+    {
+        if (-not $script:CurrentPrinter) { return }
+        Show-AdvancedDialog -Printer $script:CurrentPrinter -Settings (Get-PrinterSettings $script:CurrentPrinter)
+    }
+    catch { Show-Error $_ }
+})
+#endregion
+
+#region Library
+function Set-Source
+{
+    param ([string]$Name)
+    if ($script:Source -eq $Name) { return }
+    $script:Source = $Name
+    $isLibrary = $Name -eq 'library'
+    $ui.PanelLibraryPath.Visibility = if ($isLibrary) { 'Visible' } else { 'Collapsed' }
+    # Library entries carry their own captured driver and settings.
+    $ui.ChkDriver.IsEnabled = -not $isLibrary
+    $ui.ChkPrefs.IsEnabled = -not $isLibrary
+    $ui.GridPrinters.UnselectAll()
+    Start-PrinterScan
+}
+$ui.RbSourcePc.Add_Checked({ try { Set-Source 'pc' } catch { Show-Error $_ } })
+$ui.RbSourceLibrary.Add_Checked({ try { Set-Source 'library' } catch { Show-Error $_ } })
+$ui.BtnSelectAll.Add_Click({ $ui.GridPrinters.SelectAll() })
+
+$ui.BtnLibraryBrowse.Add_Click({
+    try
+    {
+        $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+        $dlg.Description = 'Choose the printer library folder (a share works fine).'
+        $dlg.ShowNewFolderButton = $true
+        if (Test-Path -LiteralPath $ui.TxtLibraryPath.Text) { $dlg.SelectedPath = $ui.TxtLibraryPath.Text }
+        if ($dlg.ShowDialog() -eq 'OK')
+        {
+            $ui.TxtLibraryPath.Text = $dlg.SelectedPath
+            Save-Settings
+            if ($script:Source -eq 'library') { Start-PrinterScan }
+        }
+    }
+    catch { Show-Error $_ }
+})
+
+function Start-SaveLibrary
+{
+    $requests = Get-PackageRequests
+    if (-not $requests) { return }
+    $ui.ExpLog.IsExpanded = $true
+    $title = if ($requests.Count -eq 1) { "Saving $($requests[0].TargetName) to the library..." } else { "Saving $($requests.Count) printers to the library..." }
+    Start-Work -Title $title -Command 'Save-PrinterToLibrary' -Arguments @{ Requests = $requests; LibraryDir = $ui.TxtLibraryPath.Text.Trim() } -OnDone {
+        param ($result, $failure)
+        if ($failure) { Show-Error $failure 'Saving to the library failed'; return }
+        Show-ResultList $result.Results 'Library'
+        if ($script:Source -eq 'library') { $script:Overrides.Clear(); Start-PrinterScan }
+    }
+}
+$ui.BtnSaveLibrary.Add_Click({ try { Start-SaveLibrary } catch { Show-Error $_ } })
+#endregion
+
+#region App update
+$UpdateInfo = $null
+$UpdateCheck = $null
+
+function Start-UpdateCheck
+{
+    # Quiet check in the background at start; only the button text changes.
+    if (-not $ToolVersion) { return }
+    $ps = [powershell]::Create()
+    [void]$ps.AddScript($WorkerBootstrap).AddArgument($WorkerCodeText).AddArgument('Get-LatestRelease').AddArgument(@{}).AddArgument($null).AddArgument($Ctx)
+    $script:UpdateCheck = @{ PS = $ps; Handle = $ps.BeginInvoke() }
+}
+
+function Complete-UpdateCheck
+{
+    $check = $script:UpdateCheck
+    $script:UpdateCheck = $null
+    try
+    {
+        $info = @($check.PS.EndInvoke($check.Handle)) | Where-Object { $_ -and $_.PSObject.Properties['__Result'] } | Select-Object -Last 1
+        if ($info)
+        {
+            $script:UpdateInfo = $info
+            if ($info.Newer)
+            {
+                $ui.TxtUpdate.Text = "Update to $($info.Tag)"
+                $ui.BtnUpdate.BorderBrush = [Windows.Media.Brush](ConvertTo-Brush '#C80032')
+                Write-Log "A new version is available: $($info.Tag) (this is $ToolVersion)."
+            }
+        }
+    }
+    catch { }
+    finally { $check.PS.Dispose() }
+}
+
+function Start-AppUpdate
+{
+    param ($Info)
+    $answer = [Windows.MessageBox]::Show($window, "Version $($Info.Tag) is available (you have $($Info.Current)).`n`nUpdate now? Printer Packager restarts afterwards.", 'Printer Packager', 'YesNo', 'Question')
+    if ("$answer" -ne 'Yes') { return }
+    Start-Work -Title "Updating to $($Info.Tag)..." -Command 'Install-AppUpdate' -Arguments @{ Url = $Info.Url; Tag = $Info.Tag } -OnDone {
+        param ($result, $failure)
+        if ($failure) { Show-Error $failure 'Update failed'; return }
+        if ($result.Restart)
+        {
+            Start-Process -FilePath $result.Restart
+            $window.Close()
+            return
+        }
+        [void][Windows.MessageBox]::Show($window, "The new version could not replace this one here (no write access?).`n`nIt was saved to:`n$($result.SavedTo)`n`nCopy it over the old PrinterPackager.exe.", 'Printer Packager', 'OK', 'Information')
+    }
+}
+
+$ui.BtnUpdate.Add_Click({
+    try
+    {
+        if (-not $ToolVersion)
+        {
+            [void][Windows.MessageBox]::Show($window, 'Updating works from PrinterPackager.exe. This copy runs as a script.', 'Printer Packager', 'OK', 'Information')
+            return
+        }
+        if ($script:UpdateInfo -and $script:UpdateInfo.Newer) { Start-AppUpdate $script:UpdateInfo; return }
+        Start-Work -Title 'Checking for updates...' -Command 'Get-LatestRelease' -OnDone {
+            param ($result, $failure)
+            if ($failure) { Show-Error $failure 'Could not check for updates'; return }
+            $script:UpdateInfo = $result
+            if ($result.Newer) { Start-AppUpdate $result }
+            else { [void][Windows.MessageBox]::Show($window, "You have the latest version ($ToolVersion).", 'Printer Packager', 'OK', 'Information') }
+        }
+    }
+    catch { Show-Error $_ }
+})
+#endregion
+
 #region Screenshot self-test
 function Save-WindowImage
 {
-    param ([string]$Path)
-    $window.UpdateLayout()
-    $source = [Windows.PresentationSource]::FromVisual($window)
+    param ([string]$Path, $Target = $window)
+    $Target.UpdateLayout()
+    $source = [Windows.PresentationSource]::FromVisual($Target)
     $scale = if ($source) { $source.CompositionTarget.TransformToDevice.M11 } else { 1 }
-    $content = $window.Content
+    $content = $Target.Content
     $rtb = [Windows.Media.Imaging.RenderTargetBitmap]::new([int]($content.ActualWidth * $scale), [int]($content.ActualHeight * $scale), [double](96 * $scale), [double](96 * $scale), [Windows.Media.PixelFormats]::Pbgra32)
     $rtb.Render($content)
     $enc = New-Object Windows.Media.Imaging.PngBitmapEncoder
@@ -2754,6 +3528,11 @@ function Invoke-ScreenshotReady
     $t.Add_Tick({
         $this.Stop()
         try { Save-WindowImage "$Screenshot-ready.png" } catch { Write-Log "Screenshot failed: $_" 'ERROR' }
+        try
+        {
+            if ($script:CurrentPrinter) { Show-AdvancedDialog -Printer $script:CurrentPrinter -Settings (Get-PrinterSettings $script:CurrentPrinter) -SnapPath "$Screenshot-advanced.png" }
+        }
+        catch { Write-Log "Advanced dialog failed: $_" 'ERROR' }
         $window.Close()
     })
     $t.Start()
@@ -2767,6 +3546,7 @@ $window.Add_ContentRendered({
         $window.Activate() | Out-Null
         $timer.Start()
         Start-PrinterScan
+        Start-UpdateCheck
         if ($Screenshot)
         {
             $window.Dispatcher.BeginInvoke([Windows.Threading.DispatcherPriority]::ApplicationIdle, [Action]{ try { Save-WindowImage "$Screenshot-loading.png" } catch { } }) | Out-Null

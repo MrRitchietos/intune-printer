@@ -35,6 +35,32 @@ function Remove-TestPrinter
     Get-TestPrinter | Remove-Printer -ErrorAction SilentlyContinue
     if (Get-PrinterPort -Name $portName -ErrorAction SilentlyContinue) { Remove-PrinterPort -Name $portName }
 }
+function Invoke-AsSystem
+{
+    # Runs a program as SYSTEM through a scheduled task, the way Intune runs installs, and returns its exit code.
+    param ([string]$FilePath, [string]$Arguments)
+    $name = 'PrinterPackagerE2E'
+    Unregister-ScheduledTask -TaskName $name -Confirm:$false -ErrorAction SilentlyContinue
+    $action = New-ScheduledTaskAction -Execute $FilePath -Argument $Arguments -WorkingDirectory (Split-Path -Parent $FilePath)
+    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+    $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 30)
+    Register-ScheduledTask -TaskName $name -Action $action -Principal $principal -Settings $settings | Out-Null
+    $started = Get-Date
+    Start-ScheduledTask -TaskName $name
+    $deadline = $started.AddMinutes(25)
+    do
+    {
+        Start-Sleep -Seconds 3
+        $task = Get-ScheduledTask -TaskName $name
+        $info = Get-ScheduledTaskInfo -TaskName $name
+    }
+    while (($task.State -eq 'Running' -or $info.LastRunTime -lt $started.AddSeconds(-5)) -and (Get-Date) -lt $deadline)
+    $code = $info.LastTaskResult
+    Unregister-ScheduledTask -TaskName $name -Confirm:$false
+    Write-Host "  SYSTEM run took $([int]((Get-Date) - $started).TotalSeconds) s"
+    return $code
+}
+
 function Show-PsadtLogs { Get-ChildItem 'C:\Windows\Logs\Software' -Filter '*.log' -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "--- $($_.FullName)"; Get-Content $_.FullName -Tail 80 } }
 
 try
@@ -105,6 +131,74 @@ try
     Assert (-not (Get-TestPrinter)) 'printer removed by uninstall'
     Assert ((Invoke-Detection $detection) -eq 1) 'not detected after uninstall'
 
+    Step 'Library: save a printer with its driver files'
+    $libName = 'E2E Zebra Label Printer'
+    $libHost = '10.123.45.68'
+    $libPort = "IP_$libHost"
+    $libDriver = 'Microsoft Print To PDF'
+    $lib = Join-Path $WorkDir 'library'
+    Get-Printer -ErrorAction SilentlyContinue | Where-Object { $_.DriverName -eq $libDriver } | Remove-Printer -ErrorAction SilentlyContinue
+    if (-not (Get-PrinterDriver -Name $libDriver -ErrorAction SilentlyContinue)) { Add-PrinterDriver -Name $libDriver }
+    if (-not (Get-PrinterPort -Name $libPort -ErrorAction SilentlyContinue)) { Add-PrinterPort -Name $libPort -PrinterHostAddress $libHost }
+    Add-Printer -Name $libName -DriverName $libDriver -PortName $libPort -Location 'Warehouse'
+    # Package the built-in driver like a vendor driver, so the driver install path really runs.
+    $env:PRINTERPACKAGER_PACKAGE_INBOX = '1'
+    $p = Start-Process -FilePath $Exe -ArgumentList '-PrinterName', "`"$libName`"", '-SaveToLibrary', '-LibraryDir', "`"$lib`"" -Wait -PassThru
+    Assert ($p.ExitCode -eq 0) "save to library exit code 0 (got $($p.ExitCode))"
+    $entry = Join-Path $lib $libName
+    foreach ($f in 'printer.json', 'capture.json', 'Logo.png') { Assert (Test-Path (Join-Path $entry $f)) "library has $f" }
+    Assert (Get-ChildItem (Join-Path $entry 'Driver') -Filter '*.inf' -Recurse) 'library has the driver files'
+    Assert ((Get-FileHash (Join-Path $entry 'Logo.png')).Hash -eq (Get-FileHash (Join-Path $PSScriptRoot '..\assets\logos\zebra.png')).Hash) 'Zebra logo picked'
+
+    Step 'Library: advanced settings (location + port 9101)'
+    $json = Get-Content (Join-Path $entry 'printer.json') -Raw | ConvertFrom-Json
+    $json.Settings.Advanced = [pscustomobject]@{ Location = 'Floor 2'; PortNumber = 9101; Duplex = 'TwoSidedLongEdge' }
+    [IO.File]::WriteAllText((Join-Path $entry 'printer.json'), ($json | ConvertTo-Json -Depth 6))
+
+    Step 'Remove the printer, its port and its driver'
+    Get-Printer | Where-Object Name -eq $libName | Remove-Printer
+    Restart-Service -Name Spooler -Force; Start-Sleep -Seconds 3
+    Remove-PrinterPort -Name $libPort -ErrorAction SilentlyContinue
+    Remove-PrinterDriver -Name $libDriver
+    Assert (-not (Get-PrinterDriver -Name $libDriver -ErrorAction SilentlyContinue)) 'driver removed'
+
+    Step 'Build the package from the library (printer not installed)'
+    $out2 = Join-Path $WorkDir 'out-library'
+    $p = Start-Process -FilePath $Exe -ArgumentList '-PrinterName', "`"$libName`"", '-FromLibrary', '-LibraryDir', "`"$lib`"", '-OutputDir', "`"$out2`"", '-AppVendor', 'Connectify', '-AppVersion', '1.0.0' -Wait -PassThru
+    Remove-Item Env:\PRINTERPACKAGER_PACKAGE_INBOX
+    Assert ($p.ExitCode -eq 0) "package from library exit code 0 (got $($p.ExitCode))"
+    $folder2 = Get-ChildItem $out2 -Directory | Select-Object -First 1
+    Assert (Get-ChildItem $folder2.FullName -Filter '*.intunewin') '.intunewin built from the library'
+    $cfg = Get-Content (Join-Path $folder2.FullName 'Package\Files\printer_config.json') -Raw | ConvertFrom-Json
+    Assert ($cfg.PortName -eq "IP_${libHost}_9101" -and $cfg.PortNumber -eq 9101) "advanced port used ($($cfg.PortName))"
+    Assert ($cfg.Location -eq 'Floor 2') 'advanced location used'
+    Assert ($cfg.DriverFolder -eq 'Driver') 'driver files are in the package'
+    $adt2 = Join-Path $folder2.FullName 'Package\Invoke-AppDeployToolkit.exe'
+    $det2 = Join-Path $folder2.FullName 'Detection.ps1'
+
+    Step 'Install as SYSTEM (like Intune), driver must be installed again'
+    $code = Invoke-AsSystem -FilePath $adt2 -Arguments '-DeploymentType Install -DeployMode Silent'
+    Assert ($code -eq 0) "SYSTEM install exit code 0 (got $code)"
+    Assert (Get-PrinterDriver -Name $libDriver -ErrorAction SilentlyContinue) 'driver installed again by the package'
+    $lp = Get-Printer | Where-Object Name -eq $libName
+    Assert $lp 'printer installed as SYSTEM'
+    Assert ($lp.PortName -eq "IP_${libHost}_9101" -and (Get-PrinterPort -Name $lp.PortName).PortNumber -eq 9101) 'port 9101 created'
+    Assert ($lp.Location -eq 'Floor 2') 'location Floor 2'
+    Assert ((Invoke-Detection $det2) -eq 0) 'detected after SYSTEM install'
+
+    Step 'Install again as SYSTEM (driver already there, must be skipped)'
+    $code = Invoke-AsSystem -FilePath $adt2 -Arguments '-DeploymentType Install -DeployMode Silent'
+    Assert ($code -eq 0) "second SYSTEM install exit code 0 (got $code)"
+    $log = Get-ChildItem 'C:\Windows\Logs\Software' -Filter '*Zebra*Install.log' | Sort-Object LastWriteTime | Select-Object -Last 1
+    Assert ($log -and (Select-String -Path $log.FullName -Pattern 'already installed; using it' -SimpleMatch -Quiet)) 'driver step skipped the second time'
+
+    Step 'Uninstall as SYSTEM'
+    $code = Invoke-AsSystem -FilePath $adt2 -Arguments '-DeploymentType Uninstall -DeployMode Silent'
+    Assert ($code -eq 0) "SYSTEM uninstall exit code 0 (got $code)"
+    Assert (-not (Get-Printer | Where-Object Name -eq $libName)) 'printer removed'
+    Assert ((Invoke-Detection $det2) -eq 1) 'not detected after uninstall'
+    if (-not (Get-PrinterDriver -Name $libDriver -ErrorAction SilentlyContinue)) { Add-PrinterDriver -Name $libDriver -ErrorAction SilentlyContinue }
+
     Step 'GUI screenshots'
     if (-not (Get-PrinterDriver -Name $driver -ErrorAction SilentlyContinue)) { Add-PrinterDriver -Name $driver }
     Add-PrinterPort -Name $portName -PrinterHostAddress $host1 -ErrorAction SilentlyContinue
@@ -112,6 +206,7 @@ try
     $p = Start-Process -FilePath $Exe -ArgumentList '-Screenshot', "`"$shots\gui`"" -PassThru
     if (-not $p.WaitForExit(120000)) { $p.Kill(); throw 'GUI did not close within 2 minutes' }
     Assert (Test-Path "$shots\gui-ready.png") 'ready screenshot saved'
+    Assert (Test-Path "$shots\gui-advanced.png") 'advanced settings window opened and saved'
     Write-Host "`nALL E2E CHECKS PASSED" -ForegroundColor Green
 }
 catch

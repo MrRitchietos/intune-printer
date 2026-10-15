@@ -37,6 +37,7 @@ namespace PrinterPackager
                 Directory.CreateDirectory(WorkRoot);
                 Log("Starting " + Assembly.GetExecutingAssembly().GetName().Version + " from " + Application.ExecutablePath);
                 CleanOldRuns();
+                RemoveOldExe();
                 appDir = ExtractPayload();
 
                 string script = File.ReadAllText(Path.Combine(appDir, "Start-PrinterPackager.ps1"), Encoding.UTF8);
@@ -54,7 +55,9 @@ namespace PrinterPackager
                         ps.AddScript(script)
                           .AddParameter("AppRoot", appDir)
                           .AddParameter("LauncherDir", Path.GetDirectoryName(Application.ExecutablePath))
-                          .AddParameter("OnReady", (Action)(() => splash?.Close()));
+                          .AddParameter("OnReady", (Action)(() => splash?.Close()))
+                          .AddParameter("ToolVersion", ToolVersion())
+                          .AddParameter("LauncherPath", Application.ExecutablePath);
                         foreach (var pair in arguments) ps.AddParameter(pair.Key, pair.Value);
 
                         ps.Streams.Information.DataAdded += (s, e) => Log(ps.Streams.Information[e.Index].ToString());
@@ -102,6 +105,31 @@ namespace PrinterPackager
                     result[name] = true;
             }
             return result;
+        }
+
+        /// <summary>Version from the build (e.g. 2.2.0 or 2.2.0-ci.5), used by the update button.</summary>
+        private static string ToolVersion()
+        {
+            var info = Assembly.GetExecutingAssembly().GetCustomAttributes(typeof(AssemblyInformationalVersionAttribute), false)
+                .OfType<AssemblyInformationalVersionAttribute>().FirstOrDefault();
+            string v = info?.InformationalVersion ?? Assembly.GetExecutingAssembly().GetName().Version.ToString();
+            int plus = v.IndexOf('+');
+            return plus > 0 ? v.Substring(0, plus) : v;
+        }
+
+        /// <summary>After an update the previous exe is left as PrinterPackager.exe.old; remove it once it is no longer running.</summary>
+        private static void RemoveOldExe()
+        {
+            try
+            {
+                string old = Application.ExecutablePath + ".old";
+                for (int i = 0; i < 10 && File.Exists(old); i++)
+                {
+                    try { File.Delete(old); }
+                    catch { Thread.Sleep(500); }
+                }
+            }
+            catch { }
         }
 
         private static string ExtractPayload()
