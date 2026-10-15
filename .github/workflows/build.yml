@@ -49,4 +49,5 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           files: dist/PrinterPackager.exe
+          prerelease: ${{ contains(github.ref_name, '-') }}
           generate_release_notes: true
