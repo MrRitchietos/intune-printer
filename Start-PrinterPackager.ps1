@@ -2390,8 +2390,8 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, Sys
                     <ColumnDefinition Width="*"/>
                     <ColumnDefinition Width="Auto"/>
                 </Grid.ColumnDefinitions>
-                <Image Name="ImgBrand" Height="34" VerticalAlignment="Center" RenderOptions.BitmapScalingMode="HighQuality"/>
-                <Border Grid.Column="1" BorderBrush="{StaticResource Line}" BorderThickness="1,0,0,0" Margin="20,2,0,2" Padding="20,0,0,0">
+                <Image Name="ImgBrand" Width="36" Height="36" VerticalAlignment="Center" RenderOptions.BitmapScalingMode="HighQuality"/>
+                <Border Grid.Column="1" BorderBrush="{StaticResource Line}" BorderThickness="1,0,0,0" Margin="16,2,0,2" Padding="16,0,0,0">
                     <StackPanel VerticalAlignment="Center">
                         <TextBlock Text="Printer Packager" FontSize="18" FontWeight="SemiBold"/>
                         <TextBlock Text="Turn an installed printer into an Intune app (PSAppDeployToolkit v4)" Foreground="{StaticResource Muted}"/>
@@ -2785,7 +2785,7 @@ function New-Bitmap
     return $bmp
 }
 
-$ui.ImgBrand.Source = New-Bitmap (Join-Path $Ctx.BrandingDir 'connectify-logo.png')
+$ui.ImgBrand.Source = New-Bitmap (Join-Path $Ctx.BrandingDir 'connectify-icon.png')
 $window.Icon = New-Bitmap (Join-Path $Ctx.BrandingDir 'connectify-icon.png')
 if ($ToolVersion) { $window.Title = "Printer Packager $ToolVersion" }
 #endregion
