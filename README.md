@@ -2,7 +2,7 @@
 
 Turn a printer that is installed on your PC into an Intune app (PSAppDeployToolkit v4).
 
-![Printer Packager](assets/screenshot.png)
+![Printer Packager](assets/screenshot-2.2.2.png)
 
 ## Use it
 
