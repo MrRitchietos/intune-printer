@@ -49,6 +49,7 @@ The printers don't need to be installed on that PC.
 - Publishing needs the Intune Administrator or Application Manager role. The first sign-in asks an admin to allow the app (Microsoft Graph Command Line Tools). An own app registration can be set as `ClientId` in `%APPDATA%\IntunePrinterPackager\settings.json`.
 - If a driver is already on the device, the install uses it and skips the driver step.
 - Windows protected print mode blocks vendor drivers. The install then stops with a clear message in the log.
+- The Intune apps are for x64 devices. ARM64 devices don't get them.
 
 ## Build
 
